@@ -494,63 +494,74 @@
 
 
 function buildGraphFromScan(A, B, metaIn){
-  const holders = (A.holdersForBubbles || []).map(h => ({
+  const holders = (A.holdersForBubbles || []).slice(0,500).map(h => ({
     address: h.address,
-    balance: Number(h.balance ?? 0),              // current token balance
-    pct: Number(h.pct ?? 0),                      // % of supply
+    balance: Number(h.balance ?? 0),
+    pct: Number(h.pct ?? 0),
     label: null,
-    tags: [],                                     // will tag creator/lp below
-    initialBuy: null,                             // filled from B.first25 if available
-    fundedBy: [], connections: [], firstBuy: null,
-    viaProxy: null
+    tags: [],
+    // peak & pctLeft will be filled from B.first25/top25 when available
+    peak: null, pctLeft: null,
+    fundedBy: [], connections: [], firstBuy: null, viaProxy: null
   }));
 
-  // Index for quick lookups
   const byAddr = new Map(holders.map(n => [n.address.toLowerCase(), n]));
 
-  // If we know first25 “firstInAmount” and current holdings, set initialBuy so the ring works
-  const first25 = (B.first25 || []);
-  for (const r of first25){
-    const a = (r.address || '').toLowerCase();
+  // Compute peak + % left for wallets we know (derived from panel B’s stats)
+  // For first25 we have: firstInAmount, totalIn, totalOut, holdings
+  for (const r of (B.first25 || [])){
+    const a = (r.address||'').toLowerCase();
     const n = byAddr.get(a);
     if (!n) continue;
-    const initial = Number(r.firstInAmount ?? 0);
-    if (initial > 0){
-      n.initialBuy = initial;                     // ring = balance / initialBuy (computed client-side)
+    const peak = Math.max(Number(r.totalIn||0), Number(r.holdings||0));
+    if (peak > 0){
+      n.peak = peak;
+      const left = Number(r.holdings||0) / peak * 100;
+      n.pctLeft = Math.max(0, Math.min(100, left));
     }
   }
 
-  // Tag creator if present
+  // Tag creator
   if (metaIn?.creator){
     const n = byAddr.get(String(metaIn.creator).toLowerCase());
     if (n){ n.tags.push('creator'); n.label = 'CREATOR'; }
   }
 
-  // Tag LP nodes if present (ensure nodes exist for LPs)
-  const lpSet = new Set((metaIn?.lpAddresses || []).map(x => String(x).toLowerCase()));
-  for (const lp of lpSet){
-    let n = byAddr.get(lp);
+  // LP nodes (ensure present & tagged)
+  const lpAddresses = (metaIn?.lpAddresses || []);
+  for (const lp of lpAddresses){
+    const key = String(lp).toLowerCase();
+    let n = byAddr.get(key);
     if (!n){
-      n = { address: lp, balance: 0, pct: 0, label: 'LP', tags: [], initialBuy: null, fundedBy: [], connections: [], firstBuy: null, viaProxy: null };
-      holders.push(n); byAddr.set(lp, n);
+      // include LP bubble even if 0% (renderer will show it)
+      n = { address: key, balance: 0, pct: 0, label: 'LP', tags: ['lp'], peak: null, pctLeft: null, fundedBy: [], connections: [], firstBuy: null, viaProxy: null };
+      holders.push(n); byAddr.set(key, n);
+    } else {
+      if (!n.tags.includes('lp')) n.tags.push('lp');
+      if (!n.label) n.label = 'LP';
     }
-    if (!n.tags.includes('lp')) n.tags.push('lp');
-    if (!n.label) n.label = 'LP';
+  }
+
+  // Optional: tag known proxies directly by address (seeded with your initial proxy)
+  const KNOWN_PROXIES = new Set([
+    '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f'
+  ]);
+  for (const addr of KNOWN_PROXIES){
+    const n = byAddr.get(addr);
+    if (n) { if (!n.tags.includes('proxy')) n.tags.push('proxy'); }
   }
 
   return {
     tokenCA: A.contract || metaIn?.contract || '',
     supply: String(A.currentSupply || 0),
     holders,
-    edges: [],                                     // you can add funding/connection edges later
+    edges: [], // You can add funding/connection edges here later
     meta: {
       creator: metaIn?.creator || null,
-      lp: (metaIn?.lpAddresses || [])[0] || null,
+      lp: lpAddresses[0] || null,
       burn: '0x0000000000000000000000000000000000000000',
       explorer: metaIn?.explorer || 'https://abscan.org',
-      knownProxies: [
-        { address: '0x1c4Ae91dfa56e49fcA849edE553759E1f5f04D9F', name: 'TG Proxy', type: 'telegram-bot' }
-      ]
+      knownProxies: Array.from(KNOWN_PROXIES).map(a => ({ address:a, name:'TG Proxy', type:'telegram-bot' }))
     }
   };
 }
@@ -577,6 +588,7 @@ const graph = buildGraphFromScan(A, (snapshot.b || {}), {
   lpAddresses: (A.lpNodes || []).map(n => n.address.toLowerCase()),
 });
 initBubbleGraph('#bubble-canvas', graph);
+
 
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
