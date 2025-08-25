@@ -579,6 +579,7 @@ initBubbleGraph('#bubble-canvas', graph);
 
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
+
     // Container B
     const B = snapshot.b || {};
     const buyers = (B.first25||[]);
