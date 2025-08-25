@@ -161,49 +161,6 @@
     return { totalUsd: total };
   }
 
-  // ======== Bubble map (D3) ========
-  function renderBubble({ root, holders, extras }){
-    root.innerHTML='';
-    const width = root.clientWidth || 960;
-    const height = Math.max(600, Math.round(width * 0.45));
-    const data = (holders||[]).concat(extras || []);
-    const svg = d3.select(root).append('svg').attr('width', width).attr('height', height);
-    const pack = d3.pack().size([width,height]).padding(3);
-    const droot = d3.hierarchy({ children:data }).sum(d=>Math.max(0.000001, d.balance||0));
-    const nodes = pack(droot).leaves();
-
-    let tip = d3.select('#bubble-tip');
-    if (tip.empty()){
-      tip = d3.select('body').append('div').attr('id','bubble-tip')
-        .style('position','fixed').style('background','#111').style('color','#fff')
-        .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
-        .style('pointer-events','none').style('opacity',0).style('z-index',9999)
-        .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
-    }
-    const fillFor = (d)=> d.data.__type==='lp' ? '#8B5CF6' : '#375a4e';
-
-    const g = svg.selectAll('g').data(nodes).enter().append('g').attr('transform',d=>`translate(${d.x},${d.y})`);
-    g.append('circle')
-      .attr('r', d=>d.r).attr('fill', fillFor)
-      .attr('stroke', d=> d.data.__type==='lp' ? '#C4B5FD' : null)
-      .attr('stroke-width', d=> d.data.__type==='lp' ? 2.5 : null)
-      .on('mouseover', (e,d)=>{
-        const pct=(d.data.pct||0).toFixed(4);
-        tip.html(d.data.__type==='lp'
-          ? `<div><strong>LP</strong> — <span class="mono">${pct}%</span> of supply</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
-          : `<div><strong><span class="mono">${pct}%</span> of supply</strong></div><div>${d.data.address.slice(0,6)}…${d.data.address.slice(-4)}</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
-        ).style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px').style('opacity',1);
-      })
-      .on('mousemove', (e)=> d3.select('#bubble-tip').style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px'))
-      .on('mouseout', ()=> d3.select('#bubble-tip').style('opacity',0))
-      .on('click', (e,d)=> window.open(`${EXPLORER}/address/${d.data.address}`,'_blank'));
-
-    g.append('text')
-      .attr('dy','.35em').style('text-anchor','middle')
-      .style('font-size', d=> Math.min(d.r*0.45, 16)).style('fill','#fff')
-      .style('pointer-events','none').classed('mono', true)
-      .text(d=> d.data.__type==='lp' ? 'LP' : `${(d.data.pct||0).toFixed(2)}%`);
-  }
 
   // ======== Persistence API (server) ========
   async function loadCachedScan(ca){
@@ -535,6 +492,71 @@
     return result;
   }
 
+
+function buildGraphFromScan(A, B, metaIn){
+  const holders = (A.holdersForBubbles || []).map(h => ({
+    address: h.address,
+    balance: Number(h.balance ?? 0),              // current token balance
+    pct: Number(h.pct ?? 0),                      // % of supply
+    label: null,
+    tags: [],                                     // will tag creator/lp below
+    initialBuy: null,                             // filled from B.first25 if available
+    fundedBy: [], connections: [], firstBuy: null,
+    viaProxy: null
+  }));
+
+  // Index for quick lookups
+  const byAddr = new Map(holders.map(n => [n.address.toLowerCase(), n]));
+
+  // If we know first25 “firstInAmount” and current holdings, set initialBuy so the ring works
+  const first25 = (B.first25 || []);
+  for (const r of first25){
+    const a = (r.address || '').toLowerCase();
+    const n = byAddr.get(a);
+    if (!n) continue;
+    const initial = Number(r.firstInAmount ?? 0);
+    if (initial > 0){
+      n.initialBuy = initial;                     // ring = balance / initialBuy (computed client-side)
+    }
+  }
+
+  // Tag creator if present
+  if (metaIn?.creator){
+    const n = byAddr.get(String(metaIn.creator).toLowerCase());
+    if (n){ n.tags.push('creator'); n.label = 'CREATOR'; }
+  }
+
+  // Tag LP nodes if present (ensure nodes exist for LPs)
+  const lpSet = new Set((metaIn?.lpAddresses || []).map(x => String(x).toLowerCase()));
+  for (const lp of lpSet){
+    let n = byAddr.get(lp);
+    if (!n){
+      n = { address: lp, balance: 0, pct: 0, label: 'LP', tags: [], initialBuy: null, fundedBy: [], connections: [], firstBuy: null, viaProxy: null };
+      holders.push(n); byAddr.set(lp, n);
+    }
+    if (!n.tags.includes('lp')) n.tags.push('lp');
+    if (!n.label) n.label = 'LP';
+  }
+
+  return {
+    tokenCA: A.contract || metaIn?.contract || '',
+    supply: String(A.currentSupply || 0),
+    holders,
+    edges: [],                                     // you can add funding/connection edges later
+    meta: {
+      creator: metaIn?.creator || null,
+      lp: (metaIn?.lpAddresses || [])[0] || null,
+      burn: '0x0000000000000000000000000000000000000000',
+      explorer: metaIn?.explorer || 'https://abscan.org',
+      knownProxies: [
+        { address: '0x1c4Ae91dfa56e49fcA849edE553759E1f5f04D9F', name: 'TG Proxy', type: 'telegram-bot' }
+      ]
+    }
+  };
+}
+
+
+   
   function renderFromData(snapshot){
     // Header note
     if (aSnap()) aSnap().textContent = snapshot.ts ? new Date(snapshot.ts).toLocaleString() : '';
@@ -548,8 +570,14 @@
       <div class="statrow mono"><b>Total Holders (approx)</b><span>${fmtNum(A.totalHolders,0)}</span></div>
       <div class="statrow mono"><b>Top 10 holders</b><span>${(A.top10Pct||0).toFixed(4)}%</span></div>
       <div class="statrow mono"><b>Creator</b><span>${A.creatorAddress ? `<a href="${EXPLORER}/address/${A.creatorAddress}" target="_blank" rel="noopener">${shortAddr(A.creatorAddress)}</a> <span class="muted">(${(A.creatorPct||0).toFixed(4)}%)</span>` : 'n/a'}</span></div>
-    `;
-    renderBubble({ root:aBubble(), holders:(A.holdersForBubbles||[]), extras:(A.lpNodes||[]) });
+    `;// NEW: build a graph object from A(+B) and call the new renderer
+const graph = buildGraphFromScan(A, (snapshot.b || {}), {
+  explorer: EXPLORER,
+  creator: A.creatorAddress || null,
+  lpAddresses: (A.lpNodes || []).map(n => n.address.toLowerCase()),
+});
+initBubbleGraph('#bubble-canvas', graph);
+
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
     // Container B
