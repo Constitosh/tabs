@@ -1,11 +1,11 @@
 /* abs-tabs-integration.js — unified A+B integration (v5)
    - Cache-first deep scan via /api/token-stats (GET) with timestamp
    - Fresh scan saver via /api/token-stats/save (POST)
-   - Container A: stats + interactive D3 graph (bubbles+edges) + snapshot ts
+   - Container A: stats + D3 bubble map + snapshot ts
    - Container B: First 25 vs Top 25 + status grid + row->funders overlay
    - Funding wallets overlay (ETH + WETH inbound before first receipt)
-   - Proxy/TG bot highlighting and edges (visible without hover)
-   - 5-min holders polling for SPECIAL_HOLDERS_CA updates header tile
+   - Proxy detection via txlistinternal for known routers (120 min window)
+   - Bubble map: zoomable, biggest-centered, % labels, peak/left in hover, LP from Dexscreener liquidity.base
 */
 (function (global) {
   const TABS = {};
@@ -22,7 +22,7 @@
   const TOP_COMMON_LIMIT = 5;
   const SPECIAL_HOLDERS_CA = '0x8c3d850313eb9621605cd6a1acb2830962426f67';
 
-  // Known proxy / TG bot routers (extend as needed)
+  // Known proxy / TG bot routers (you can add more later)
   const KNOWN_PROXIES = new Set([
     '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f' // Telegram bot (provided)
   ]);
@@ -30,17 +30,11 @@
 
   // ======== DOM ========
   const $ = (s) => document.querySelector(s);
-
-  // Status line (center)
   const scanStatusEl = () => $('#scanStatus');
-
-  // Container A
   const aSnap = () => $('#aSnapshot');
   const aStats = () => $('#aTokenStats');
   const aBubble = () => $('#bubble-canvas');
   const aBubbleNote = () => $('#a-bubble-note');
-
-  // Container B
   const bStatusGrid = () => $('#statusGrid');
   const firstBtn = () => $('#btnFirst25');
   const topBtn = () => $('#btnTop25');
@@ -54,8 +48,6 @@
   const buyersPanel = () => $('#buyersPanelB');
   const holdersExpander = () => $('#holdersExpander');
   const holdersToggle = () => $('#holdersToggle');
-
-  // Overlays + header tile
   const fundersOverlay = () => $('#fundersOverlay');
   const fundersInner = () => $('#fundersInner');
   const commonOverlay = () => $('#commonOverlay');
@@ -124,6 +116,9 @@
   async function apiTxlist(address){
     return apiGet({ module:'account', action:'txlist', address, startblock:0, endblock:99999999, sort:'asc' });
   }
+  async function apiTxlistinternal(address, {startblock=0, endblock=99999999}={}){
+    return apiGet({ module:'account', action:'txlistinternal', address, startblock, endblock, page:1, offset:10000, sort:'asc' });
+  }
   async function apiBalance(address){
     const r = await apiGet({ module:'account', action:'balance', address, tag:'latest' });
     return Number(r)/1e18;
@@ -135,6 +130,48 @@
   }
 
   // ======== Dexscreener helpers ========
+  // 1) Find LP pair addresses (fallback)
+  async function getPairAddresses(contract){
+    const out = new Set();
+    try{
+      const pr = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
+      const pd = await pr.json();
+      if (Array.isArray(pd)){
+        for (const p of pd){
+          let pa = String(p?.pairAddress||'').toLowerCase(); if (!pa) continue;
+          if (pa.includes(':')) pa = pa.split(':')[0];
+          if (/^0x[a-f0-9]{40}$/.test(pa)) out.add(pa);
+        }
+      }
+    }catch{}
+    return Array.from(out);
+  }
+  // 2) LP allocation from tokens/v1/abstract (liquidity.base)
+  async function getLPBaseAllocation(contract){
+    // returns { baseSum: number (token units, decimals-adjusted?), perPair: Map(pairAddress -> base) }
+    const result = { baseSum: 0, perPair: new Map() };
+    try{
+      const r = await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${contract}`);
+      if (!r.ok) return result;
+      const arr = await r.json();
+      // Depending on API shape, look into any nested "pairs" or "liquidity" entries
+      // Normalize: accumulate liquidity.base across all entries that reference this token as base.
+      const flat = Array.isArray(arr) ? arr : [];
+      for (const t of flat){
+        const ps = Array.isArray(t?.pairs) ? t.pairs : (Array.isArray(t?.markets) ? t.markets : []);
+        for (const p of (ps||[])){
+          const base = Number(p?.liquidity?.base || 0);
+          const pa = String(p?.pairAddress || '').toLowerCase();
+          if (base > 0){
+            result.baseSum += base;
+            if (pa) result.perPair.set(pa, (result.perPair.get(pa)||0) + base);
+          }
+        }
+      }
+    }catch{}
+    return result;
+  }
+
   async function priceUsdForToken(contract){
     try{
       const res = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
@@ -167,7 +204,6 @@
     return { totalUsd: total };
   }
 
-
   // ======== Persistence API (server) ========
   async function loadCachedScan(ca){
     try{
@@ -198,7 +234,7 @@
       if (seen.has(to)) continue;
       out.push({ address:to, timeStamp:Number(l.timeStamp||l.blockTimestamp||0), txHash:l.transactionHash, firstInAmount:0 });
       seen.add(to);
-      if (out.length>=27) break; // drop the first two (likely LP/mints)
+      if (out.length>=27) break; // we will drop the first two (likely LP/mints)
     }
     return out.slice(2);
   }
@@ -220,45 +256,24 @@
     return { ...rec, firstInAmount:firstIn, timeStamp: earliestTs!==Infinity ? earliestTs : rec.timeStamp, totalIn, totalOut, holdings:h, status, sClass };
   }
 
-  // ======== Funding discovery & overlays ========
-  // Extended: optional fromTs lower bound to support N-minute window
-  async function getFundingWallets(addr, cutoffTs, fromTs){
+  // ======== Funding discovery & overlays (kept) ========
+  async function getFundingWallets(addr, cutoffTs){
     const [nativeTxs, erc20Txs] = await Promise.all([
       apiTxlist(addr).catch(()=>[]),
       apiTokentx({ address:addr }).catch(()=>[])
     ]);
-    const lb = fromTs ? Number(fromTs) : null;
-    const ub = cutoffTs ? Number(cutoffTs) : null;
 
-    const inboundTimeOk = (ts) => {
-      const t = Number(ts||0);
-      if (ub != null && t > ub) return false;
-      if (lb != null && t < lb) return false;
-      return true;
-    };
-
-    const incomingEth = nativeTxs.filter(tx =>
-      (tx.to||'').toLowerCase()===addr.toLowerCase() && inboundTimeOk(tx.timeStamp)
-    );
+    const incomingEth = nativeTxs.filter(tx => (tx.to||'').toLowerCase()===addr.toLowerCase() && (!cutoffTs || Number(tx.timeStamp)<=Number(cutoffTs)));
     const ethMap = new Map();
     for (const tx of incomingEth){
-      const from=(tx.from||'').toLowerCase();
-      const prev=ethMap.get(from)||{ count:0, amount:0 };
-      prev.count++; prev.amount += Number(tx.value||0)/1e18;
-      ethMap.set(from,prev);
+      const from=(tx.from||'').toLowerCase(); const prev=ethMap.get(from)||{ count:0, amount:0 }; prev.count++; prev.amount += Number(tx.value||0)/1e18; ethMap.set(from,prev);
     }
 
-    const incomingWeth = erc20Txs.filter(t =>
-      (t.tokenSymbol||'').toUpperCase()==='WETH' && (t.to||'').toLowerCase()===addr.toLowerCase() && inboundTimeOk(t.timeStamp)
-    );
+    const incomingWeth = erc20Txs.filter(t => (t.tokenSymbol||'').toUpperCase()==='WETH' && (t.to||'').toLowerCase()===addr.toLowerCase() && (!cutoffTs || Number(t.timeStamp)<=Number(cutoffTs)));
     const wethMap = new Map();
     for (const t of incomingWeth){
-      const from=(t.from||'').toLowerCase();
-      const dec=Number(t.tokenDecimal||18);
-      const amt=unitsToNum(t.value, dec);
-      const prev=wethMap.get(from)||{ count:0, amount:0 };
-      prev.count++; prev.amount+=amt;
-      wethMap.set(from,prev);
+      const from=(t.from||'').toLowerCase(); const dec=Number(t.tokenDecimal||18); const amt=unitsToNum(t.value, dec);
+      const prev=wethMap.get(from)||{ count:0, amount:0 }; prev.count++; prev.amount+=amt; wethMap.set(from,prev);
     }
 
     const merged = new Map();
@@ -267,6 +282,421 @@
     return { addrs:Array.from(merged.keys()), info:merged };
   }
 
+  // ======== Full token overview (scan) + save ========
+  async function doFreshScan(contract){
+    const result = { meta:{ contract }, a:{}, b:{} };
+
+    setScanStatus('Downloading token transfer history…');
+    const txs = await fetchAllTokenTx(contract);
+    if (!txs.length) throw new Error('No transactions found for this token.');
+    const tokenDecimals = chooseDecimals(txs);
+
+    setScanStatus('Resolving creator & supply metrics…');
+    let creatorAddress = '';
+    try{
+      const cRes = await fetch(`${BASE_URL}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${ETHERSCAN_API}`);
+      const cData = await cRes.json();
+      creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator) ? cData.result[0].contractCreator.toLowerCase() : '';
+    }catch{}
+
+    // Supply + balances
+    const ZERO = '0x0000000000000000000000000000000000000000';
+    const DEAD = '0x000000000000000000000000000000000000dead';
+    const burnSet = new Set([ZERO, DEAD]);
+
+    const balances = {};
+    let mintedUnits=0n, burnedUnits=0n;
+    const firstInMap = new Map();
+
+    for (const t of txs){
+      const from=(t.from||t.fromAddress||'').toLowerCase(); const to=(t.to||t.toAddress||'').toLowerCase();
+      const v=toBI(t.value||'0'); const ts=Number(t.timeStamp)||0;
+      if (from===ZERO) mintedUnits+=v;
+      if (burnSet.has(to)) burnedUnits+=v;
+      if (from===contract || to===contract) continue; // ignore contract self-moves
+      if (!burnSet.has(from)) balances[from]=(balances[from]||0n)-v;
+      if (!burnSet.has(to))   balances[to]=(balances[to]||0n)+v;
+      if (!firstInMap.has(to) && !burnSet.has(to)) firstInMap.set(to, { ts, v });
+    }
+    const currentSupplyUnits = mintedUnits>=burnedUnits ? (mintedUnits-burnedUnits) : 0n;
+    const currentSupply = Number(currentSupplyUnits)/(10**tokenDecimals);
+
+    // LP addresses and LP allocation (liquidity.base)
+    setScanStatus('Fetching LP pairs & allocation…');
+    let pairAddresses = await getPairAddresses(contract);
+    const lpAlloc = await getLPBaseAllocation(contract);
+    const pairSet = new Set(pairAddresses);
+
+    setScanStatus('Building holders set…');
+    let holdersAll = Object.entries(balances)
+      .filter(([addr,bal])=> bal>0n && !burnSet.has(addr) && !pairSet.has(addr))
+      .map(([address,units])=>({ address, units }));
+    holdersAll.sort((a,b)=> (b.units>a.units) ? 1 : (b.units<a.units) ? -1 : 0);
+
+    // verify top balances against chain at head (top 150)
+    setScanStatus('Verifying top balances…');
+    const toVerify = holdersAll.slice(0,150).map(h=>h.address); const verified={};
+    for (let i=0;i<toVerify.length;i++){ const a=toVerify[i]; verified[a]=await tokenBalanceOf(contract,a).catch(()=>null); await sleep(100); }
+    const vset=new Set(toVerify); const corrected=[];
+    for (const h of holdersAll){
+      if (vset.has(h.address)){
+        const v=verified[h.address];
+        if (v===null) corrected.push(h); else if (v===0n) continue; else corrected.push({ address:h.address, units:v });
+      } else corrected.push(h);
+    }
+    holdersAll = corrected; holdersAll.sort((a,b)=> (b.units>a.units)?1:(b.units<a.units)?-1:0);
+
+    // Map to bubble holders (cap at 500, filter <0.001%)
+    const holdersForBubblesRaw = holdersAll.slice(0,500).map(h=>{
+      const pct = currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0;
+      return { address:h.address, units:h.units, balance:Number(h.units)/(10**tokenDecimals), pct };
+    }).filter(h => (h.pct || 0) >= 0.001);
+
+    // Create LP node(s) from liquidity.base (allocation)
+    const lpNodes = [];
+    for (const pa of pairAddresses){
+      let base = lpAlloc.perPair.get(pa) || 0;
+      // Fallback to on-chain balance if API lacks base
+      if (!(base > 0)){
+        const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
+        base = Number(units)/(10**tokenDecimals);
+      }
+      const lpPct = currentSupply > 0 ? Math.max(0, (base / currentSupply) * 100) : 0;
+      lpNodes.push({ address:pa, balance:base, pct: lpPct, __type:'lp' });
+      await sleep(40);
+    }
+
+    const top10Pct = holdersForBubblesRaw.slice(0,10).reduce((s,h)=> s+(h.pct||0),0);
+    const creatorPct = creatorAddress ? (holdersForBubblesRaw.find(h=>h.address.toLowerCase()===creatorAddress)?.pct || 0) : 0;
+
+    // Detect proxy connections (txlistinternal)
+    setScanStatus('Scanning proxy connections (internal tx)…');
+    const viaProxyAddrs = [];
+    const graphEdges = [];
+    const KNOWN = KNOWN_PROXIES; // lowercase set
+    // Build a fast lookup of first-receipt times for funding window
+    const firstTs = new Map();
+    for (const [addr, obj] of firstInMap.entries()) firstTs.set(addr.toLowerCase(), Number(obj.ts)||0);
+
+    // Limit to speed (e.g., first 200 bubbles after filter)
+    const candidates = holdersForBubblesRaw.slice(0, 200);
+    for (const h of candidates){
+      const addr = h.address.toLowerCase();
+      const ts = firstTs.get(addr) || 0;
+      const winStart = ts ? (ts - FUNDING_WINDOW_SECS) : 0;
+      const winEnd   = ts ? (ts + FUNDING_WINDOW_SECS) : 0;
+      try{
+        const internals = await apiTxlistinternal(addr, { startblock:0, endblock:99999999 }).catch(()=>[]);
+        let tagged = false;
+        for (const it of internals){
+          const from = String(it.from||'').toLowerCase();
+          const to   = String(it.to||'').toLowerCase();
+          const tts  = Number(it.timeStamp||0);
+          if (KNOWN.has(from) && to === addr){
+            if (!ts || (tts>=winStart && tts<=winEnd)){
+              viaProxyAddrs.push(addr);
+              graphEdges.push({ type:'proxy', source: from, target: addr, weight: 2 });
+              tagged = true;
+              break;
+            }
+          }
+        }
+        // small breath between calls
+        await sleep(60);
+        if (tagged) continue;
+      }catch{}
+    }
+
+    // A (stats + bubble inputs)
+    const holdersForBubbles = holdersForBubblesRaw.map(h => ({
+      address: h.address,
+      balance: h.balance,
+      pct: h.pct
+    }));
+
+    result.a = {
+      contract,
+      tokenDecimals,
+      minted: Number(mintedUnits)/(10**tokenDecimals),
+      burned: Number(burnedUnits)/(10**tokenDecimals),
+      currentSupply,
+      currentSupplyUnits: String(currentSupplyUnits),
+      totalHolders: holdersAll.length,
+      top10Pct,
+      creatorAddress,
+      creatorPct,
+      holdersForBubbles,
+      lpNodes,
+      viaProxyAddrs,
+      graphEdges
+    };
+
+    // B (holders + receivers)
+    setScanStatus('Fetching Transfer logs…');
+    const receivers = await getFirst27Receivers(contract);
+    const enriched=[];
+    setScanStatus('Computing totals & statuses per wallet…');
+    for (const r of receivers){
+      const st = await enrichReceiverStats(contract, r).catch(()=>null);
+      if (st) enriched.push(st);
+      await sleep(50);
+    }
+
+    const top25 = holdersAll.slice(0,25).map((h,i)=>{
+      const first = firstInMap.get(h.address) || { ts:0, v:0n };
+      return {
+        rank: i+1,
+        address: h.address,
+        firstIn: Number(first.v)/(10**tokenDecimals),
+        holdings: Number(h.units)/(10**tokenDecimals),
+        pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
+      };
+    });
+
+    result.b = { first25: enriched.slice(0,25), top25 };
+
+    // done
+    return result;
+  }
+
+  // ======== Bubble graph builder + renderer ========
+  function buildGraphFromScan(A, B){
+    const holderNodes = (A.holdersForBubbles || []).map(h => ({
+      address: h.address,
+      balance: Number(h.balance || 0),
+      pct: Number(h.pct || 0),
+      tags: [],
+      label: null
+    }));
+
+    const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
+
+    // LP nodes
+    for (const lp of (A.lpNodes || [])){
+      const key = String(lp.address||'').toLowerCase();
+      if (!byAddr.has(key)){
+        byAddr.set(key, { address:key, balance:Number(lp.balance||0), pct:Number(lp.pct||0), tags:['lp'], label:'LP' });
+      }else{
+        const n = byAddr.get(key);
+        n.tags = n.tags || [];
+        if (!n.tags.includes('lp')) n.tags.push('lp');
+        if (!n.label) n.label = 'LP';
+        n.pct = Number(lp.pct || n.pct || 0);
+        n.balance = Number(lp.balance || n.balance || 0);
+      }
+    }
+
+    // Creator tag
+    if (A.creatorAddress){
+      const key = String(A.creatorAddress).toLowerCase();
+      const n = byAddr.get(key);
+      if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); if (!n.label) n.label = 'CREATOR'; }
+    }
+
+    // Proxy tag
+    const via = new Set((A.viaProxyAddrs||[]).map(a=>String(a).toLowerCase()));
+    for (const [k,n] of byAddr.entries()){
+      if (via.has(k)){ n.tags = n.tags || []; if(!n.tags.includes('via-proxy')) n.tags.push('via-proxy'); }
+    }
+
+    // Peak/Left for everyone:
+    // - If we have B.first25 enriched stats, use totalIn/holdings.
+    // - Otherwise, fallback: peak = current balance; left = 100%.
+    const first25By = new Map((B.first25||[]).map(r => [String(r.address).toLowerCase(), r]));
+    const top25By   = new Map((B.top25||[]).map(r => [String(r.address).toLowerCase(), r]));
+    for (const [k,n] of byAddr.entries()){
+      const r = first25By.get(k) || top25By.get(k);
+      let peak, leftTokens, leftPct;
+      if (r){
+        const totIn = Number(r.totalIn || r.firstIn || 0);
+        const cur   = Number(r.holdings || n.balance || 0);
+        peak = Math.max(totIn, cur);
+        leftTokens = cur;
+        leftPct = peak>0 ? (cur/peak)*100 : 0;
+      }else{
+        // best-effort fallback
+        peak = Number(n.balance||0);
+        leftTokens = Number(n.balance||0);
+        leftPct = peak>0 ? 100 : 0;
+      }
+      n.peakTokens = peak;
+      n.leftTokens = leftTokens;
+      n.leftPct    = leftPct;
+    }
+
+    const edges = Array.isArray(A.graphEdges) ? A.graphEdges.slice() : [];
+
+    return {
+      explorer: EXPLORER,
+      nodes: Array.from(byAddr.values()),
+      edges
+    };
+  }
+
+  function renderBubbleGraph(rootEl, graph){
+    const EX = graph.explorer || 'https://abscan.org';
+    const nodes = (graph.nodes || []).slice(0, 500);
+    const edges = graph.edges || [];
+
+    rootEl.innerHTML = '';
+    const width  = rootEl.clientWidth || 960;
+    const height = Math.max(560, Math.round(width * 0.48));
+
+    const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+    const rootG = svg.append('g');
+    const linkG = rootG.append('g').attr('class','links');
+    const nodeG = rootG.append('g').attr('class','nodes');
+
+    const roleColor = (tags=[]) => {
+      const set = new Set(tags.map(t => String(t).toLowerCase()));
+      if (set.has('lp'))      return '#8b5cf6';  // LP
+      return '#375a4e';                         // default holders & creator
+    };
+    const roleStroke = (tags=[]) => {
+      const set = new Set(tags.map(t => String(t).toLowerCase()));
+      if (set.has('lp')) return '#c4b5fd';
+      return 'rgba(0,0,0,.35)';
+    };
+
+    // radius by % of supply (sqrt) — biggest centered later via forces
+    const maxPct = Math.max(0.0001, ...nodes.map(n => +n.pct || 0));
+    const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
+    nodes.forEach(n => { n.r = rScale(+n.pct || 0); if (!n.tags) n.tags = []; });
+
+    // initial seeds using pack
+    const pack = d3.pack().size([width, height]).padding(3);
+    const pRoot = d3.hierarchy({ children: nodes }).sum(d => (d && d.r ? d.r * d.r : 1));
+    const leaves = pack(pRoot).leaves();
+    const addrKey = a => String(a||'').toLowerCase();
+    const seed   = new Map(leaves.map(l => [addrKey(l.data.address), l]));
+    nodes.forEach(n => { const s = seed.get(addrKey(n.address)); n.x = s ? s.x : Math.random()*width; n.y = s ? s.y : Math.random()*height; });
+
+    // biggest to center + gentle drift
+    const cx = width/2, cy = height/2;
+    const maxR = Math.max(...nodes.map(n => n.r || 0), 1);
+    const nSize = d => Math.max(0, Math.min(1, (d.r || 1)/maxR));
+    const centerStrength = d => 0.06 + 0.18 * ((nSize(d) - 0.3) / 0.7);
+
+    const sim = d3.forceSimulation(nodes)
+      .alpha(0.9)
+      .velocityDecay(0.35)                 // “space drift”
+      .force('collide', d3.forceCollide(d => Math.max(6, d.r)).strength(0.9))
+      .force('x', d3.forceX(cx).strength(d => centerStrength(d)))
+      .force('y', d3.forceY(cy).strength(d => centerStrength(d)))
+      .on('tick', ticked);
+
+    nodes.forEach(n => { n.vx = (Math.random()-0.5)*0.3; n.vy = (Math.random()-0.5)*0.3; });
+
+    // zoom/pan
+    const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
+    svg.call(zoom);
+    svg.on('mousedown.stop-sim', () => sim.alphaTarget(0).stop());
+
+    // edges (proxy etc.)
+    const linkSel = linkG.selectAll('line').data(edges, d => `${d.source}|${d.target}|${d.type}`).join('line')
+      .attr('stroke', d => d.type === 'proxy' ? '#ffd54a' : '#89b6a0')
+      .attr('stroke-opacity', d => d.type === 'proxy' ? 0.9 : 0.25)
+      .attr('stroke-width', d => Math.max(1.5, d.weight || 1.5));
+
+    // nodes
+    const nodeSel = nodeG.selectAll('g.node').data(nodes, d => d.address).join(enter => {
+      const g = enter.append('g').attr('class','node').attr('transform', d => `translate(${d.x},${d.y})`).style('cursor','pointer');
+
+      g.append('circle')
+        .attr('r', d => Math.max(8, d.r || 8))
+        .attr('fill', d => roleColor(d.tags))
+        .attr('fill-opacity', 0.95)
+        .attr('stroke', d => roleStroke(d.tags)).attr('stroke-width', d => (d.tags||[]).includes('lp') ? 2.5 : 1);
+
+      // proxy ring (always visible if tagged)
+      g.append('circle')
+        .attr('class','proxy-ring')
+        .attr('r', d => Math.max(8, d.r || 8) + 2)
+        .attr('fill', 'none')
+        .attr('stroke', d => {
+          const tags = (d.tags||[]).map(t => String(t).toLowerCase());
+          return (tags.includes('proxy') || tags.includes('via-proxy')) ? '#ffd54a' : 'none';
+        })
+        .attr('stroke-width', 2);
+
+      // % label
+      g.append('text')
+        .text(d => `${(+d.pct || 0).toFixed(2)}%`)
+        .attr('text-anchor','middle').attr('dy','0.32em')
+        .attr('font-size', d => Math.max(9, Math.min(12, (d.r||12)/3 + 7)))
+        .attr('pointer-events','none')
+        .attr('fill','rgba(0,0,0,.85)');
+
+      g.on('click', (ev,d)=> window.open(`${EX}/address/${d.address}`, '_blank'));
+
+      const tip = getTip();
+      g.on('mouseenter', (ev,d)=>{
+        const tags = d.tags && d.tags.length ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : '';
+        const peakTokens = isFinite(d.peakTokens) ? d.peakTokens : null;
+        const leftTokens = isFinite(d.leftTokens) ? d.leftTokens : null;
+        const leftPct    = isFinite(d.leftPct) ? d.leftPct : null;
+        const peakHtml = `<div><b>Peak held:</b> ${peakTokens!=null ? fmtNum(peakTokens,6) : '—'} tokens</div>`;
+        const leftHtml = `<div><b>Left:</b> ${leftTokens!=null ? fmtNum(leftTokens,6) : '—'} tokens${leftPct!=null ? ` (${leftPct.toFixed(1)}%)` : ''}</div>`;
+        tip.html(`
+          <div style="font-weight:700;margin-bottom:4px">${(+d.pct||0).toFixed(2)}% of supply</div>
+          <div><b>Address:</b> ${d.address}</div>
+          ${peakHtml}${leftHtml}${tags}
+          <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
+        `).style('opacity',1);
+      }).on('mousemove', (ev)=>{
+        const x = ev.clientX+12, y = ev.clientY+12;
+        getTip().style('left', x+'px').style('top', y+'px');
+      }).on('mouseleave', ()=> getTip().style('opacity',0));
+
+      return g;
+    });
+
+    // fit to view
+    fitToView();
+    function fitToView(){
+      const bbox = nodeG.node().getBBox();
+      const pad = 28;
+      const k = Math.min(
+        (width  - pad*2) / Math.max(1, bbox.width),
+        (height - pad*2) / Math.max(1, bbox.height)
+      );
+      const scale = Math.max(0.7, Math.min(3, k));
+      const tx = (width  - scale*(bbox.x + bbox.width/2));
+      const ty = (height - scale*(bbox.y + bbox.height/2));
+      svg.transition().duration(450).call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+    }
+
+    function ticked(){
+      nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+      linkSel
+        .attr('x1', d => pos(d.source).x).attr('y1', d => pos(d.source).y)
+        .attr('x2', d => pos(d.target).x).attr('y2', d => pos(d.target).y);
+    }
+    const index = new Map(nodes.map(n => [addrKey(n.address), n]));
+    function pos(a){ const n = index.get(addrKey(a)); return n || { x: cx, y: cy }; }
+
+    function getTip(){
+      let tip = d3.select('#bubble-tip');
+      if (tip.empty()){
+        tip = d3.select('body').append('div').attr('id','bubble-tip')
+          .style('position','fixed').style('background','#111').style('color','#fff')
+          .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
+          .style('pointer-events','none').style('opacity',0).style('z-index',9999)
+          .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
+      }
+      return tip;
+    }
+    function fmtNum(n, d=4){
+      if (!isFinite(n)) return '0';
+      const abs = Math.abs(n);
+      if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'k';
+      return Number(n).toLocaleString(undefined, { maximumFractionDigits: d });
+    }
+  }
+
+  // ======== Container B rendering (unchanged) ========
   function renderStatusGrid(list25){
     const grid=bStatusGrid(); grid.innerHTML='';
     list25.slice(0,25).forEach(r=>{
@@ -295,9 +725,7 @@
       <td class="mono">${(r.pct||0).toFixed(4)}%</td>
     </tr>`;
   }
-
   function wireBuyerRowClicks(){
-    // Click a row → open funders overlay and start scan.
     const wire = (tbody) => {
       if (!tbody) return;
       tbody.querySelectorAll('tr').forEach(tr=>{
@@ -333,22 +761,22 @@
           Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
         </div>
         ${top.map(r=>{
-          const portal=`https://portal.abs.xyz/profile/${r.address}`; const abscan=`${EXPLORER}/address/${r.address}`;
-          return `<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
+          const portal=\`https://portal.abs.xyz/profile/\${r.address}\`; const abscan=\`${EXPLORER}/address/\${r.address}\`;
+          return \`<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
             <div>
-              <div class="addr mono" style="font-weight:700">${r.address}</div>
+              <div class="addr mono" style="font-weight:700">\${r.address}</div>
               <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">\${fmtNum(r.meta.ethAmount,6)} (\${r.meta.ethCount})</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">\${fmtNum(r.meta.wethAmount,6)} (\${r.meta.wethCount})</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">\${fmtNum(r.tokenUsd,2)}</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">\${fmtNum(r.eth,6)}</span></span>
               </div>
             </div>
             <div class="links" style="display:flex;gap:8px;flex-shrink:0">
-              <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>
-              <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>
+              <button class="btn mono" onclick="window.open('\${portal}','_blank')">Portal</button>
+              <a class="btn mono" href="\${abscan}" target="_blank" rel="noopener">Explorer</a>
             </div>
-          </div>`;
+          </div>\`;
         }).join('')}
         <div style="margin-top:10px; display:none">
           <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
@@ -394,345 +822,10 @@
     }catch(e){ commonInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`; }
   }
 
-  // ======== Full token overview (scan) + save ========
-  async function doFreshScan(contract){
-    const result = { meta:{ contract }, a:{}, b:{} };
-
-    setScanStatus('Downloading token transfer history…');
-    const txs = await fetchAllTokenTx(contract);
-    if (!txs.length) throw new Error('No transactions found for this token.');
-    const tokenDecimals = chooseDecimals(txs);
-
-    setScanStatus('Resolving creator & supply metrics…');
-    let creatorAddress = '';
-    try{
-      const cRes = await fetch(`${BASE_URL}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${ETHERSCAN_API}`);
-      const cData = await cRes.json();
-      creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator) ? cData.result[0].contractCreator.toLowerCase() : '';
-    }catch{}
-
-    // LP pair addresses (for LP bubbles)
-    let pairAddresses = [];
-    try{
-      const pr = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
-      const pd = await pr.json();
-      if (Array.isArray(pd)){
-        for (const p of pd){
-          let pa = String(p?.pairAddress||'').toLowerCase(); if (!pa) continue;
-          if (pa.includes(':')) pa = pa.split(':')[0];
-          if (/^0x[a-f0-9]{40}$/.test(pa)) pairAddresses.push(pa);
-        }
-      }
-    }catch{}
-    pairAddresses = Array.from(new Set(pairAddresses));
-    const pairSet = new Set(pairAddresses);
-
-    const ZERO = '0x0000000000000000000000000000000000000000';
-    const DEAD = '0x000000000000000000000000000000000000dead';
-    const burnSet = new Set([ZERO, DEAD]);
-
-    const balances = {};
-    let mintedUnits=0n, burnedUnits=0n;
-    const firstInMap = new Map();
-
-    for (const t of txs){
-      const from=(t.from||t.fromAddress||'').toLowerCase(); const to=(t.to||t.toAddress||'').toLowerCase();
-      const v=toBI(t.value||'0'); const ts=Number(t.timeStamp)||0;
-      if (from===ZERO) mintedUnits+=v;
-      if (burnSet.has(to)) burnedUnits+=v;
-      // ignore contract self-moves
-      if (from===contract || to===contract) continue;
-      if (!burnSet.has(from)) balances[from]=(balances[from]||0n)-v;
-      if (!burnSet.has(to))   balances[to]=(balances[to]||0n)+v;
-      if (!firstInMap.has(to) && !burnSet.has(to)) firstInMap.set(to, { ts, v });
-    }
-    const currentSupply = mintedUnits>=burnedUnits ? (mintedUnits-burnedUnits) : 0n;
-
-    setScanStatus('Building holders set…');
-    let holdersAll = Object.entries(balances)
-      .filter(([addr,bal])=> bal>0n && !burnSet.has(addr) && !pairSet.has(addr))
-      .map(([address,units])=>({ address, units }));
-    holdersAll.sort((a,b)=> (b.units>a.units) ? 1 : (b.units<a.units) ? -1 : 0);
-
-    // verify top balances against chain at head (top 150)
-    setScanStatus('Verifying top balances…');
-    const toVerify = holdersAll.slice(0,150).map(h=>h.address); const verified={};
-    for (let i=0;i<toVerify.length;i++){ const a=toVerify[i]; verified[a]=await tokenBalanceOf(contract,a).catch(()=>null); await sleep(100); }
-    const vset=new Set(toVerify); const corrected=[];
-    for (const h of holdersAll){
-      if (vset.has(h.address)){
-        const v=verified[h.address];
-        if (v===null) corrected.push(h); else if (v===0n) continue; else corrected.push({ address:h.address, units:v });
-      } else corrected.push(h);
-    }
-    holdersAll = corrected; holdersAll.sort((a,b)=> (b.units>a.units)?1:(b.units<a.units)?-1:0);
-
-    const holdersForBubbles = holdersAll.slice(0,500).map(h=>({ address:h.address, balance:Number(h.units)/(10**tokenDecimals), pct: currentSupply>0n ? pctUnits(h.units,currentSupply):0 }));
-    const lpNodes=[];
-    for (const pa of pairAddresses){
-      const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
-      lpNodes.push({ address:pa, balance:Number(units)/(10**tokenDecimals), pct: currentSupply>0n? pctUnits(units,currentSupply):0, __type:'lp' });
-      await sleep(50);
-    }
-    const top10Pct = holdersForBubbles.slice(0,10).reduce((s,h)=> s+(h.pct||0),0);
-    const creatorPct = creatorAddress ? (holdersForBubbles.find(h=>h.address.toLowerCase()===creatorAddress)?.pct || 0) : 0;
-
-    // A (stats)
-    result.a = {
-      tokenDecimals,
-      minted: Number(mintedUnits)/(10**tokenDecimals),
-      burned: Number(burnedUnits)/(10**tokenDecimals),
-      currentSupply: Number(currentSupply)/(10**tokenDecimals),
-      totalHolders: holdersAll.length,
-      top10Pct,
-      creatorAddress,
-      creatorPct,
-      holdersForBubbles,
-      lpNodes
-    };
-
-    // B (holders + receivers)
-    const top25 = holdersAll.slice(0,25).map((h,i)=>{
-      const first = firstInMap.get(h.address) || { ts:0, v:0n };
-      return {
-        rank: i+1,
-        address: h.address,
-        firstIn: Number(first.v)/(10**tokenDecimals),
-        holdings: Number(h.units)/(10**tokenDecimals),
-        pct: currentSupply>0n ? pctUnits(h.units, currentSupply) : 0
-      };
-    });
-
-    setScanStatus('Fetching Transfer logs…');
-    const receivers = await getFirst27Receivers(contract);
-    const enriched=[];
-    setScanStatus('Computing totals & statuses per wallet…');
-    for (const r of receivers){
-      const st = await enrichReceiverStats(contract, r).catch(()=>null);
-      if (st) enriched.push(st);
-      await sleep(50);
-    }
-
-    result.b = { first25: enriched.slice(0,25), top25 };
-
-    // ---- Build graph edges & extra nodes (LPs, funders, proxies) ----
-    const edges = [];
-    const extraNodes = [];
-    const seenExtra = new Set();
-    const ensureExtra = (addr, tags=[])=>{
-      const key = String(addr||'').toLowerCase();
-      if (!key || seenExtra.has(key)) return;
-      extraNodes.push({ address:key, balance:0, pct:0, label:null, tags:[...new Set(tags)] });
-      seenExtra.add(key);
-    };
-
-    // Include LP pair addresses as nodes (ensure present)
-    for (const n of result.a.lpNodes || []){
-      ensureExtra(n.address, ['lp']);
-    }
-
-    // For first25 receivers, find funders within 120 minutes before first receipt
-    const firstList = (result.b.first25 || []).slice(0,25);
-    for (const r of firstList){
-      const buyer = (r.address || '').toLowerCase();
-      const cutoffTs = Number(r.timeStamp || 0);
-      const fromTs = cutoffTs ? (cutoffTs - FUNDING_WINDOW_SECS) : null;
-
-      let addrs = [];
-      try{
-        const resp = await getFundingWallets(buyer, cutoffTs, fromTs);
-        addrs = Array.isArray(resp?.addrs) ? resp.addrs : [];
-      }catch{}
-
-      const uniq = Array.from(new Set(addrs.map(a => String(a||'').toLowerCase())));
-      for (const f of uniq){
-        if (!f) continue;
-        const isProxy = KNOWN_PROXIES.has(f);
-        edges.push({ source:f, target:buyer, type: isProxy ? 'proxy' : 'funding', weight:1 });
-        const tags = ['funder']; if (isProxy) tags.push('proxy');
-        ensureExtra(f, tags);
-        if (isProxy){
-          r._viaProxy = true;
-        }
-      }
-    }
-
-    // Attach graph bits to A so renderer can use them
-    result.a.graphEdges = edges;
-    result.a.graphExtraNodes = extraNodes;
-    result.a.viaProxyAddrs = Array.from(new Set(firstList.filter(x=>x._viaProxy).map(x=>x.address.toLowerCase())));
-
-    // done
-    return result;
-  }
-
-function renderBubbleGraph(rootEl, graph){
-  const EX = graph.explorer || 'https://abscan.org';
-  const nodes = (graph.nodes || []).slice(0, 500);
-  const edges = graph.edges || [];
-
-  rootEl.innerHTML = '';
-  const width  = rootEl.clientWidth || 960;
-  const height = Math.max(560, Math.round(width * 0.48));
-
-  const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
-  const rootG = svg.append('g');
-  const linkG = rootG.append('g').attr('class','links');
-  const nodeG = rootG.append('g').attr('class','nodes');
-
-  const roleColor = (tags=[]) => {
-    const set = new Set(tags.map(t => String(t).toLowerCase()));
-    if (set.has('creator')) return '#ffd166';
-    if (set.has('lp'))      return '#c586ff';
-    if (set.has('burn'))    return '#94a3b8';
-    if (set.has('funder'))  return '#07c160';
-    return 'var(--text)';
-  };
-
-  // radius by % of supply (sqrt)
-  const maxPct = Math.max(0.0001, ...nodes.map(n => +n.pct || 0));
-  const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
-  nodes.forEach(n => { n.r = rScale(+n.pct || 0); if (!n.tags) n.tags = []; });
-
-  // initial seeds using pack
-  const pack = d3.pack().size([width, height]).padding(3);
-  const pRoot = d3.hierarchy({ children: nodes }).sum(d => (d && d.r ? d.r * d.r : 1));
-  const leaves = pack(pRoot).leaves();
-  const addrKey = a => String(a||'').toLowerCase();
-  const seed   = new Map(leaves.map(l => [addrKey(l.data.address), l]));
-  nodes.forEach(n => { const s = seed.get(addrKey(n.address)); n.x = s ? s.x : Math.random()*width; n.y = s ? s.y : Math.random()*height; });
-
-  // biggest to center + gentle drift
-  const cx = width/2, cy = height/2;
-  const maxR = Math.max(...nodes.map(n => n.r || 0), 1);
-  const nSize = d => Math.max(0, Math.min(1, (d.r || 1)/maxR));
-  const centerStrength = d => 0.06 + 0.18 * ((nSize(d) - 0.3) / 0.7);
-
-  const sim = d3.forceSimulation(nodes)
-    .alpha(0.9)
-    .velocityDecay(0.35)
-    .force('collide', d3.forceCollide(d => Math.max(6, d.r)).strength(0.9))
-    .force('x', d3.forceX(cx).strength(d => centerStrength(d)))
-    .force('y', d3.forceY(cy).strength(d => centerStrength(d)))
-    .on('tick', ticked);
-
-  nodes.forEach(n => { n.vx = (Math.random()-0.5)*0.3; n.vy = (Math.random()-0.5)*0.3; });
-
-  // zoom/pan
-  const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
-  svg.call(zoom);
-  svg.on('mousedown.stop-sim', () => sim.alphaTarget(0).stop());
-
-  // edges
-  const linkSel = linkG.selectAll('line').data(edges, d => `${d.source}|${d.target}|${d.type}`).join('line')
-    .attr('stroke', d => d.type === 'funding' ? '#07c160' : (d.type === 'proxy' ? '#ffd54a' : '#89b6a0'))
-    .attr('stroke-opacity', d => d.type === 'proxy' ? 0.85 : 0.25)
-    .attr('stroke-width', d => Math.max(1, d.weight || 1));
-
-  // nodes
-  const nodeSel = nodeG.selectAll('g.node').data(nodes, d => d.address).join(enter => {
-    const g = enter.append('g').attr('class','node').attr('transform', d => `translate(${d.x},${d.y})`).style('cursor','pointer');
-
-    g.append('circle')
-      .attr('r', d => Math.max(8, d.r || 8))
-      .attr('fill', d => roleColor(d.tags))
-      .attr('fill-opacity', 0.95)
-      .attr('stroke', 'rgba(0,0,0,.35)').attr('stroke-width', 1);
-
-    // proxy ring
-    g.append('circle')
-      .attr('class','proxy-ring')
-      .attr('r', d => Math.max(8, d.r || 8) + 2)
-      .attr('fill', 'none')
-      .attr('stroke', d => {
-        const tags = (d.tags||[]).map(t => String(t).toLowerCase());
-        return (tags.includes('proxy') || tags.includes('via-proxy')) ? '#ffd54a' : 'none';
-      })
-      .attr('stroke-width', 2);
-
-    // % label
-    g.append('text')
-      .text(d => `${(+d.pct || 0).toFixed(2)}%`)
-      .attr('text-anchor','middle').attr('dy','0.32em')
-      .attr('font-size', d => Math.max(9, Math.min(12, (d.r||12)/3 + 7)))
-      .attr('pointer-events','none')
-      .attr('fill','rgba(0,0,0,.85)');
-
-    g.on('click', (ev,d)=> window.open(`${EX}/address/${d.address}`, '_blank'));
-
-    const tip = getTip();
-    g.on('mouseenter', (ev,d)=>{
-      const tags = d.tags && d.tags.length ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : '';
-      const peak = (d.peak!=null) ? `<div><b>Peak held:</b> ${fmtNum(d.peak)} — <b>Left:</b> ${d.pctLeft!=null ? d.pctLeft.toFixed(1)+'%' : '—'}</div>` : '';
-      tip.html(`
-        <div style="font-weight:700;margin-bottom:4px">${(+d.pct||0).toFixed(2)}%</div>
-        <div><b>Address:</b> ${d.address}</div>
-        ${tags}${peak}
-        <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
-      `).style('opacity',1);
-    }).on('mousemove', (ev)=>{
-      const x = ev.clientX+12, y = ev.clientY+12;
-      getTip().style('left', x+'px').style('top', y+'px');
-    }).on('mouseleave', ()=> getTip().style('opacity',0));
-
-    return g;
-  });
-
-  // fit to view
-  fitToView();
-  function fitToView(){
-    const bbox = nodeG.node().getBBox();
-    const pad = 28;
-    const k = Math.min(
-      (width  - pad*2) / Math.max(1, bbox.width),
-      (height - pad*2) / Math.max(1, bbox.height)
-    );
-    const scale = Math.max(0.7, Math.min(3, k));
-    const tx = (width  - scale*(bbox.x + bbox.width/2));
-    const ty = (height - scale*(bbox.y + bbox.height/2));
-    svg.transition().duration(450).call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-  }
-
-  function ticked(){
-    nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
-    linkSel
-      .attr('x1', d => pos(d.source).x).attr('y1', d => pos(d.source).y)
-      .attr('x2', d => pos(d.target).x).attr('y2', d => pos(d.target).y);
-  }
-  const map = new Map(nodes.map(n => [addrKey(n.address), n]));
-  function pos(a){ const n = map.get(addrKey(a)); return n || { x: cx, y: cy }; }
-
-  function getTip(){
-    let tip = d3.select('#bubble-tip');
-    if (tip.empty()){
-      tip = d3.select('body').append('div').attr('id','bubble-tip')
-        .style('position','fixed').style('background','#111').style('color','#fff')
-        .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
-        .style('pointer-events','none').style('opacity',0).style('z-index',9999)
-        .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
-    }
-    return tip;
-  }
-
-  function fmtNum(n){
-    if (!isFinite(n)) return '0';
-    const abs = Math.abs(n);
-    if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-    if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-    if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'k';
-    return Number(n).toLocaleString(undefined, { maximumFractionDigits: 4 });
-  }
-}
-
-
-
-   
-  // ======== Render snapshot ========
+  // ======== Render snapshot to UI ========
   function renderFromData(snapshot){
-    // Header note
     if (aSnap()) aSnap().textContent = snapshot.ts ? new Date(snapshot.ts).toLocaleString() : '';
 
-    // Container A
     const A = snapshot.a || {};
     aStats().innerHTML = `
       <div class="statrow mono"><b>Minted</b><span>${fmtNum(A.minted,6)}</span></div>
@@ -743,55 +836,14 @@ function renderBubbleGraph(rootEl, graph){
       <div class="statrow mono"><b>Creator</b><span>${A.creatorAddress ? `<a href="${EXPLORER}/address/${A.creatorAddress}" target="_blank" rel="noopener">${shortAddr(A.creatorAddress)}</a> <span class="muted">(${(A.creatorPct||0).toFixed(4)}%)</span>` : 'n/a'}</span></div>
     `;
 
-// --- Build nodes: holders + LP + extra hubs (funders/proxies) ---
-const byAddr = new Map();
-const addNode = (n)=>{ const k=(n.address||'').toLowerCase(); if(!k||byAddr.has(k)) return; byAddr.set(k, n); };
-
-const B = snapshot.b || {};
-
-(A.holdersForBubbles||[]).forEach(h => addNode({ address:h.address, balance:h.balance, pct:h.pct, tags:[], label:null }));
-(A.lpNodes||[]).forEach(lp => addNode({ address:lp.address, balance:lp.balance, pct:lp.pct, tags:['lp'], label:'LP' }));
-(A.graphExtraNodes||[]).forEach(x => addNode(x));
-
-// Peak + % left (from panel B first25)
-for (const r of (B.first25 || [])){
-  const k = (r.address||'').toLowerCase();
-  const n = byAddr.get(k);
-  if (!n) continue;
-  const peak = Math.max(Number(r.totalIn||0), Number(r.holdings||0));
-  if (peak > 0){
-    n.peak = peak;
-    n.pctLeft = Math.max(0, Math.min(100, (Number(r.holdings||0)/peak) * 100));
-  }
-}
-
-// Tag creator
-if (A.creatorAddress){
-  const n = byAddr.get(A.creatorAddress.toLowerCase());
-  if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); n.label = n.label || 'CREATOR'; }
-}
-
-// Tag buyers that used a proxy (via-proxy)
-if (Array.isArray(A.viaProxyAddrs)){
-  const via = new Set(A.viaProxyAddrs.map(a=>String(a).toLowerCase()));
-  for (const [k,n] of byAddr.entries()){
-    if (via.has(k)){ n.tags = n.tags||[]; if(!n.tags.includes('via-proxy')) n.tags.push('via-proxy'); }
-  }
-}
-
-const graph = {
-  explorer: EXPLORER,
-  nodes: Array.from(byAddr.values()),
-  edges: (A.graphEdges || [])
-};
-
-// Render the bubbles
-renderBubbleGraph(aBubble(), graph);
-
+    // Build & render bubble graph
+    const graph = buildGraphFromScan(A, (snapshot.b || {}));
+    renderBubbleGraph(aBubble(), graph);
 
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
-    // Container B
+    // Container B (unchanged)
+    const B = snapshot.b || {};
     const buyers = (B.first25||[]);
     const holders = (B.top25||[]);
     renderStatusGrid(buyers);
@@ -819,7 +871,6 @@ renderBubbleGraph(aBubble(), graph);
       };
     }
 
-    // default view
     buyersPanel().style.display=''; holdersPanel().style.display='none';
     firstBtn().classList.add('active'); topBtn().classList.remove('active');
   }
@@ -863,10 +914,29 @@ renderBubbleGraph(aBubble(), graph);
     setInterval(()=>computeApproxHolders(SPECIAL_HOLDERS_CA), 5*60*1000);
   }
 
+  // ======== Internals ========
+  async function fetchAllTokenTx(contract){
+    const all=[]; const offset=10000; let page=1;
+    while(true){
+      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&page=${page}&offset=${offset}&sort=asc&apikey=${ETHERSCAN_API}`;
+      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: [];
+      if (!arr.length) break; all.push(...arr); if (arr.length<offset) break; page++; if (page>200) break; await sleep(MIN_INTERVAL_MS);
+    }
+    if (!all.length){
+      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${ETHERSCAN_API}`;
+      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: []; all.push(...arr);
+    }
+    return all;
+  }
+  function chooseDecimals(txs){
+    const freq=new Map(); for (const t of txs){ const d=parseInt(String(t.tokenDecimal||''),10); if (Number.isFinite(d)&&d>=0&&d<=18) freq.set(d,(freq.get(d)||0)+1); }
+    if (!freq.size) return 18;
+    let best=18, cnt=-1; for (const [d,c] of freq.entries()){ if (c>cnt || (c===cnt && d>best)){ best=d; cnt=c; } } return best;
+  }
+
   // ======== Public API ========
   TABS.startScan = async function(ca, { force=false } = {}){
     if (!isCA(ca)){ setScanStatus('Enter a valid token contract.'); return; }
-    // wipe UI
     aSnap().textContent=''; aStats().innerHTML=''; aBubble().innerHTML=''; aBubbleNote().textContent='';
     buyersTop5().innerHTML=''; buyersRest().innerHTML=''; holdersTop5().innerHTML=''; holdersRest().innerHTML='';
     bStatusGrid().innerHTML='';
@@ -890,7 +960,6 @@ renderBubbleGraph(aBubble(), graph);
     bStatusGrid().innerHTML='';
   };
 
-  // Buttons & overlays
   function wireTabButtons(){
     if (!firstBtn() || !topBtn()) return;
     firstBtn().onclick = ()=>{ firstBtn().classList.add('active'); topBtn().classList.remove('active'); buyersPanel().style.display=''; holdersPanel().style.display='none'; };
@@ -910,26 +979,6 @@ renderBubbleGraph(aBubble(), graph);
     wireOverlays();
     startHoldersPoll();
   };
-
-  // ======== Internals ========
-  async function fetchAllTokenTx(contract){
-    const all=[]; const offset=10000; let page=1;
-    while(true){
-      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&page=${page}&offset=${offset}&sort=asc&apikey=${ETHERSCAN_API}`;
-      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: [];
-      if (!arr.length) break; all.push(...arr); if (arr.length<offset) break; page++; if (page>200) break; await sleep(MIN_INTERVAL_MS);
-    }
-    if (!all.length){
-      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${ETHERSCAN_API}`;
-      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: []; all.push(...arr);
-    }
-    return all;
-  }
-  function chooseDecimals(txs){
-    const freq=new Map(); for (const t of txs){ const d=parseInt(String(t.tokenDecimal||''),10); if (Number.isFinite(d)&&d>=0&&d<=18) freq.set(d,(freq.get(d)||0)+1); }
-    if (!freq.size) return 18;
-    let best=18, cnt=-1; for (const [d,c] of freq.entries()){ if (c>cnt || (c===cnt && d>best)){ best=d; cnt=c; } } return best;
-  }
 
   // Expose
   global.TABS_EXT = TABS;
