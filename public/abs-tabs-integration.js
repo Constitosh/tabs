@@ -494,31 +494,56 @@ async function doFreshScan(contract){
     connectedMap
   };
 
-  // ===== B (first 25 + top 25) for peak/left hover
-  setScanStatus('Fetching Transfer logs…');
-  const receivers = await getFirst27Receivers(contract);
-  const enriched=[];
+  // ===== B (first 25 + top 25) — exclude proxy addresses from both views =====
+  setScanStatus('Preparing tables…');
+
+  // Build “early receivers” from our single-pass firstInMap (faster & accurate)
+  // Only keep addresses that currently hold (>0), are NOT proxies/LP/burn.
+  const holderSetNow = new Set(holdersAll.map(h => h.address.toLowerCase()));
+  const earlyReceiversRaw = [];
+  for (const [addr, rec] of firstInMap.entries()){
+    const a = String(addr).toLowerCase();
+    if (!holderSetNow.has(a)) continue;               // only real current holders
+    if (proxySet.has(a)) continue;                    // exclude any proxy address itself
+    if (pairSet.has(a)) continue;                     // exclude LP
+    if (a === ZERO || a === DEAD || a === contract) continue;
+    earlyReceiversRaw.push({
+      address: addr,
+      timeStamp: Number(rec.ts)||0,
+      firstInAmount: Number(rec.v)/(10**tokenDecimals)
+    });
+  }
+  // Oldest first, then take 25
+  earlyReceiversRaw.sort((a,b)=> (a.timeStamp - b.timeStamp));
+  const early25 = earlyReceiversRaw.slice(0,25);
+
+  // Enrich the 25 for the status grid (re-using existing helper)
+  const enriched = [];
   setScanStatus('Computing totals & statuses per wallet…');
-  for (const r of receivers){
+  for (const r of early25){
     const st = await enrichReceiverStats(contract, r).catch(()=>null);
     if (st) enriched.push(st);
-    await sleep(40);
+    await sleep(30);
   }
 
-  const top25 = holdersAll.slice(0,25).map((h,i)=>{
-    const first = firstInMap.get(h.address) || { ts:0, v:0n };
-    return {
-      rank: i+1,
-      address: h.address,
-      firstIn: Number(first.v)/(10**tokenDecimals),
-      holdings: Number(h.units)/(10**tokenDecimals),
-      pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
-    };
-  });
+  // Top 25 holders (exclude proxy addresses)
+  const top25 = holdersAll
+    .filter(h => !proxySet.has(String(h.address).toLowerCase()))
+    .slice(0,25)
+    .map((h,i)=>{
+      const first = firstInMap.get(h.address) || { ts:0, v:0n };
+      return {
+        rank: i+1,
+        address: h.address,
+        firstIn: Number(first.v)/(10**tokenDecimals),
+        holdings: Number(h.units)/(10**tokenDecimals),
+        pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
+      };
+    });
 
-  result.b = { first25: enriched.slice(0,25), top25 };
+  result.b = { first25: enriched, top25 };
   return result;
-}
+
 
 
 
@@ -599,7 +624,6 @@ function renderBubbleGraph(rootEl, graph){
 
   // holders only in this map
   const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
-  const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp')); // kept but not drawn while SHOW_LP=false
 
   rootEl.innerHTML = '';
   const width  = rootEl.clientWidth || 960;
@@ -613,12 +637,10 @@ function renderBubbleGraph(rootEl, graph){
 
   // Colors & strokes
   const FILL_HOLDER  = '#375a4e';
-  const FILL_LP      = '#8b5cf6';
-  const STROKE_LP    = '#c4b5fd';
   const STROKE_DEF   = 'rgba(0,0,0,.35)';
   const STROKE_CONN  = '#00d1b2'; // shared funder (non-proxy)
 
-  // === per-proxy stroke colors
+  // Per-proxy color palette
   const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>n.proxyId)));
   const proxyColor = d3.scaleOrdinal()
     .domain(proxyIds)
@@ -629,69 +651,51 @@ function renderBubbleGraph(rootEl, graph){
     ]);
 
   // Radius by % of supply (sqrt)
-  const maxPct = Math.max(0.0001, ...holders.map(n => +n.pct || 0), ...lps.map(n => +n.pct || 0));
+  const maxPct = Math.max(0.0001, ...holders.map(n => +n.pct || 0));
   const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
   holders.forEach(n => n.r = rScale(+n.pct || 0));
-  lps.forEach(n => n.r = rScale(+n.pct || 0));
 
-  // 1) Pack to put big ones near the center
+  // 1) Pack to produce reasonable seeds (bigger tend toward center)
   const pack = d3.pack().size([width*0.8, height*0.9]).padding(8);
   const pRoot = d3.hierarchy({ children: holders }).sum(d => (d && d.r ? d.r * d.r : 1));
   const leaves = pack(pRoot).leaves();
   const seed   = new Map(leaves.map(l => [String(l.data.address).toLowerCase(), l]));
   holders.forEach(n => { const s = seed.get(String(n.address).toLowerCase()); n.x = s ? s.x : 0; n.y = s ? s.y : 0; });
 
-  // 2) One-time collision resolve (static — no drifting afterwards)
+  // 2) One-time settle with size-weighted center pull → big in the middle
+  const cx = width * 0.4, cy = height * 0.5;
+  const maxR = Math.max(...holders.map(n => n.r||0), 1);
+  const sizeNorm = d => Math.max(0, Math.min(1, (d.r||1)/maxR));
+  const centerStrength = d => 0.03 + 0.22 * Math.pow(sizeNorm(d), 1.25); // small → weak pull, big → strong pull
+
   const sim = d3.forceSimulation(holders)
     .alpha(1)
     .velocityDecay(0.25)
-    .force('collide', d3.forceCollide(d => (d.r||8) + 3).strength(1)) // +3px gap so bubbles never touch
-    .force('cx', d3.forceX(width*0.4).strength(0.02))
-    .force('cy', d3.forceY(height*0.5).strength(0.02))
+    .force('collide', d3.forceCollide(d => (d.r||8) + 3).strength(1)) // +3px gap
+    .force('x', d3.forceX(cx).strength(d => centerStrength(d)))
+    .force('y', d3.forceY(cy).strength(d => centerStrength(d)))
     .stop();
-  for (let i=0;i<140;i++) sim.tick(); // settle, then freeze
-
-  // Optional LP column (kept for later; hidden by SHOW_LP=false)
-  if (SHOW_LP && lps.length){
-    // place to the right of the packed holders
-    const hb = {
-      x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
-      x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r)
-    };
-    const lpGap = 22;
-    const lpAreaX = hb.x2 + lpGap + (width*0.05);
-    let lpY = hb.y + 20;
-    lps.forEach(n => { n.x = lpAreaX + n.r; n.y = lpY + n.r; lpY += n.r*2 + 22; });
-  }
+  for (let i=0;i<160;i++) sim.tick(); // settle, then freeze
 
   // Zoom (manual; no simulation on drag)
   const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
   svg.call(zoom);
 
-  // Nodes to draw
-  const ALL = SHOW_LP ? holders.concat(lps) : holders;
-
-  const nodeSel = rootG.selectAll('g.node').data(ALL, d => d.address).join(enter => {
+  // Draw nodes
+  const nodeSel = rootG.selectAll('g.node').data(holders, d => d.address).join(enter => {
     const g = enter.append('g').attr('class','node')
       .attr('transform', d => `translate(${d.x},${d.y})`)
       .style('cursor','pointer');
 
-    // Base circle
     g.append('circle')
       .attr('r', d => Math.max(8, d.r || 8))
-      .attr('fill', d => (d.tags||[]).includes('lp') ? FILL_LP : FILL_HOLDER)
+      .attr('fill', FILL_HOLDER)
       .attr('fill-opacity', 0.95)
-      .attr('stroke', d => {
-        if ((d.tags||[]).includes('lp')) return STROKE_LP;
-        if (d.proxyId) return proxyColor(d.proxyId);
-        if (d.connectId) return STROKE_CONN;
-        return STROKE_DEF;
-      })
-      .attr('stroke-width', d => ((d.tags||[]).includes('lp') || d.proxyId || d.connectId) ? 2 : 1.2);
+      .attr('stroke', d => d.proxyId ? proxyColor(d.proxyId) : (d.connectId ? STROKE_CONN : STROKE_DEF))
+      .attr('stroke-width', d => (d.proxyId || d.connectId) ? 2 : 1.2);
 
-    // % label (never larger than bubble)
     g.append('text')
-      .text(d => (d.tags||[]).includes('lp') ? 'LP' : `${(+d.pct || 0).toFixed(2)}%`)
+      .text(d => `${(+d.pct || 0).toFixed(2)}%`)
       .attr('text-anchor','middle').attr('dy','0.32em')
       .attr('pointer-events','none')
       .attr('fill','rgba(255,255,255,.88)')
@@ -701,29 +705,28 @@ function renderBubbleGraph(rootEl, graph){
         return Math.min(base, maxFs);
       });
 
-    // Hover – highlight same proxy group (color varies by proxy) or the shared-funder group
     const tip = getTip();
     g.on('mouseenter', (ev,d)=>{
       if (d.proxyId){
         nodeSel.selectAll('circle').attr('opacity', n => (n.proxyId && n.proxyId===d.proxyId) ? 1 : 0.35);
-        nodeSel.selectAll('circle').attr('stroke-width', n => (n.proxyId && n.proxyId===d.proxyId) ? 3.5 : (((n.tags||[]).includes('lp') || n.connectId) ? 2 : 1.2));
+        nodeSel.selectAll('circle').attr('stroke-width', n => (n.proxyId && n.proxyId===d.proxyId) ? 3.5 : (n.connectId ? 2 : 1.2));
       } else if (d.connectId){
         nodeSel.selectAll('circle').attr('opacity', n => (n.connectId && n.connectId===d.connectId) ? 1 : 0.35);
-        nodeSel.selectAll('circle').attr('stroke-width', n => (n.connectId && n.connectId===d.connectId) ? 3.5 : (((n.tags||[]).includes('lp') || n.proxyId) ? 2 : 1.2));
+        nodeSel.selectAll('circle').attr('stroke-width', n => (n.connectId && n.connectId===d.connectId) ? 3.5 : (n.proxyId ? 2 : 1.2));
       }
       tip.html(`
         <div style="font-weight:700;margin-bottom:4px">${(+d.pct||0).toFixed(2)}% of supply</div>
         <div><b>Address:</b> ${d.address}</div>
         <div><b>Peak held:</b> ${isFinite(d.peakTokens)? fmtNum(d.peakTokens,6):'—'} tokens</div>
         <div><b>Left:</b> ${isFinite(d.leftTokens)? fmtNum(d.leftTokens,6):'—'} tokens${isFinite(d.leftPct)? ` (${d.leftPct.toFixed(1)}%)` : ''}</div>
-        ${d.proxyId  ? `<div class="mono" style="opacity:.85">Proxy group: ${d.proxyId}</div>` : ''}
-        ${d.connectId? `<div class="mono" style="opacity:.85">Shared funder: ${d.connectId}</div>` : ''}
+        ${d.proxyId  ? `<div class="mono" style="opacity:.85">Proxy group</div>` : ''}
+        ${d.connectId? `<div class="mono" style="opacity:.85">Shared funder</div>` : ''}
         <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
       `).style('opacity',1);
     }).on('mousemove', (ev)=>{
       getTip().style('left',(ev.clientX+12)+'px').style('top',(ev.clientY+12)+'px');
     }).on('mouseleave', ()=>{
-      nodeSel.selectAll('circle').attr('opacity', 1).attr('stroke-width', d => ((d.tags||[]).includes('lp') || d.proxyId || d.connectId) ? 2 : 1.2);
+      nodeSel.selectAll('circle').attr('opacity', 1).attr('stroke-width', d => (d.proxyId || d.connectId) ? 2 : 1.2);
       getTip().style('opacity',0);
     });
 
@@ -731,7 +734,7 @@ function renderBubbleGraph(rootEl, graph){
     return g;
   });
 
-  // Fit view once (holders only)
+  // Fit view once
   fitToView();
   function fitToView(){
     const bbox = rootG.node().getBBox();
@@ -742,6 +745,24 @@ function renderBubbleGraph(rootEl, graph){
     const ty = (height - scale*(bbox.y + bbox.height/2));
     const z = d3.zoom().scaleExtent([0.6,7]).on('zoom', (ev)=> rootG.attr('transform', ev.transform));
     svg.call(z).transition().duration(450).call(z.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+  }
+
+  // Tiny legend to tell "proxy color vs shared funder"
+  const legend = svg.append('g').attr('transform', `translate(${width-170},${14})`);
+  legend.append('rect').attr('width',156).attr('height', proxyIds.length ? 46 : 28)
+    .attr('fill','rgba(0,0,0,.35)').attr('rx',8);
+  legend.append('text').attr('x',10).attr('y',18).attr('fill','#fff').attr('font-size',11).text('Group strokes:');
+  if (proxyIds.length){
+    legend.append('line').attr('x1',12).attr('y1',28).attr('x2',44).attr('y2',28)
+      .attr('stroke', proxyColor(proxyIds[0])).attr('stroke-width',3.5);
+    legend.append('text').attr('x',50).attr('y',31).attr('fill','#fff').attr('font-size',11).text('Proxy group');
+    legend.append('line').attr('x1',12).attr('y1',40).attr('x2',44).attr('y2',40)
+      .attr('stroke', STROKE_CONN).attr('stroke-width',3.5);
+    legend.append('text').attr('x',50).attr('y',43).attr('fill','#fff').attr('font-size',11).text('Shared funder');
+  } else {
+    legend.append('line').attr('x1',12).attr('y1',28).attr('x2',44).attr('y2',28)
+      .attr('stroke', STROKE_CONN).attr('stroke-width',3.5);
+    legend.append('text').attr('x',50).attr('y',31).attr('fill','#fff').attr('font-size',11).text('Shared funder');
   }
 
   function getTip(){
@@ -764,6 +785,7 @@ function renderBubbleGraph(rootEl, graph){
     return Number(n).toLocaleString(undefined,{ maximumFractionDigits:d });
   }
 }
+
 
 
 
