@@ -543,7 +543,7 @@ async function doFreshScan(contract){
 
   result.b = { first25: enriched, top25 };
   return result;
-
+}
 
 
 
@@ -1081,4 +1081,4 @@ function renderBubbleGraph(rootEl, graph){
 
   // Expose
   global.TABS_EXT = TABS;
-}(window);
+})(window); 
