@@ -342,9 +342,8 @@
 const denomUnits = currentSupplyUnits;
 
      
-    // Base supply denominator = sum of all positive balances (excludes burns)
-  
-      .reduce((acc,[addr,bi]) => acc + (bi>0n ? bi : 0n), 0n);
+
+   
 
 
     // LP addresses & allocation
