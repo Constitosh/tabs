@@ -28,7 +28,7 @@
     '0x20BF96Ad879bA4D6904595ed05BC8d0Ce226B99a',
     '0xcca5047E4C9f9D72F11C199B4ff1960f88A4748d' // Telegram bot (provided)
   ]);
-  const FUNDING_WINDOW_SECS = 120 * 60;  // 120 minutes
+  const FUNDING_WINDOW_SECS = 720 * 60;  // 120 minutes
 
   // ======== DOM ========
   const $ = (s) => document.querySelector(s);
