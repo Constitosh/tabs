@@ -726,6 +726,7 @@ function renderBubbleGraph(rootEl, graph){
 }
 
 
+   
   // ======== Render snapshot ========
   function renderFromData(snapshot){
     // Header note
@@ -742,49 +743,52 @@ function renderBubbleGraph(rootEl, graph){
       <div class="statrow mono"><b>Creator</b><span>${A.creatorAddress ? `<a href="${EXPLORER}/address/${A.creatorAddress}" target="_blank" rel="noopener">${shortAddr(A.creatorAddress)}</a> <span class="muted">(${(A.creatorPct||0).toFixed(4)}%)</span>` : 'n/a'}</span></div>
     `;
 
-    // Build nodes: holders + LP + extra hubs (funders/proxies)
-    const byAddr = new Map();
-    const addNode = (n)=>{ const k=(n.address||'').toLowerCase(); if(!k||byAddr.has(k)) return; byAddr.set(k, n); };
+// --- Build nodes: holders + LP + extra hubs (funders/proxies) ---
+const byAddr = new Map();
+const addNode = (n)=>{ const k=(n.address||'').toLowerCase(); if(!k||byAddr.has(k)) return; byAddr.set(k, n); };
 
-    (A.holdersForBubbles||[]).forEach(h => addNode({ address:h.address, balance:h.balance, pct:h.pct, tags:[], label:null }));
-    (A.lpNodes||[]).forEach(lp => addNode({ address:lp.address, balance:lp.balance, pct:lp.pct, tags:['lp'], label:'LP' }));
-    (A.graphExtraNodes||[]).forEach(x => addNode(x));
+const A = snapshot.a || {};
+const B = snapshot.b || {};
 
-    // Peak + % left (from panel B first25)
-    const B = snapshot.b || {};
-    for (const r of (B.first25 || [])){
-      const k = (r.address||'').toLowerCase();
-      const n = byAddr.get(k);
-      if (!n) continue;
-      const peak = Math.max(Number(r.totalIn||0), Number(r.holdings||0));
-      if (peak > 0){
-        n.peak = peak;
-        n.pctLeft = Math.max(0, Math.min(100, (Number(r.holdings||0)/peak) * 100));
-      }
-    }
+(A.holdersForBubbles||[]).forEach(h => addNode({ address:h.address, balance:h.balance, pct:h.pct, tags:[], label:null }));
+(A.lpNodes||[]).forEach(lp => addNode({ address:lp.address, balance:lp.balance, pct:lp.pct, tags:['lp'], label:'LP' }));
+(A.graphExtraNodes||[]).forEach(x => addNode(x));
 
-    // Tag creator
-    if (A.creatorAddress){
-      const n = byAddr.get(A.creatorAddress.toLowerCase());
-      if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); n.label = n.label || 'CREATOR'; }
-    }
+// Peak + % left (from panel B first25)
+for (const r of (B.first25 || [])){
+  const k = (r.address||'').toLowerCase();
+  const n = byAddr.get(k);
+  if (!n) continue;
+  const peak = Math.max(Number(r.totalIn||0), Number(r.holdings||0));
+  if (peak > 0){
+    n.peak = peak;
+    n.pctLeft = Math.max(0, Math.min(100, (Number(r.holdings||0)/peak) * 100));
+  }
+}
 
-    // Tag buyers that used a proxy (via-proxy)
-    if (Array.isArray(A.viaProxyAddrs)){
-      const via = new Set(A.viaProxyAddrs.map(a=>String(a).toLowerCase()));
-      for (const [k,n] of byAddr.entries()){
-        if (via.has(k)){ n.tags = n.tags||[]; if(!n.tags.includes('via-proxy')) n.tags.push('via-proxy'); }
-      }
-    }
+// Tag creator
+if (A.creatorAddress){
+  const n = byAddr.get(A.creatorAddress.toLowerCase());
+  if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); n.label = n.label || 'CREATOR'; }
+}
 
-    const graph = {
-      explorer: EXPLORER,
-      nodes: Array.from(byAddr.values()),
-      edges: (A.graphEdges || [])
-    };
+// Tag buyers that used a proxy (via-proxy)
+if (Array.isArray(A.viaProxyAddrs)){
+  const via = new Set(A.viaProxyAddrs.map(a=>String(a).toLowerCase()));
+  for (const [k,n] of byAddr.entries()){
+    if (via.has(k)){ n.tags = n.tags||[]; if(!n.tags.includes('via-proxy')) n.tags.push('via-proxy'); }
+  }
+}
 
-    // Render interactive graph
-    renderBubbleGraph(aBubble(), graph);
+const graph = {
+  explorer: EXPLORER,
+  nodes: Array.from(byAddr.values()),
+  edges: (A.graphEdges || [])
+};
+
+// Render the bubbles
+renderBubbleGraph(aBubble(), graph);
+
 
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
