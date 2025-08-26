@@ -496,6 +496,7 @@
     result.b = { first25: enriched, top25 };
     return result;
   }
+   }
 
   function buildGraphFromScan(A, B){
     const holderNodes = (A.holdersForBubbles || []).map(h => ({
@@ -1063,4 +1064,3 @@ fundersInner().innerHTML = `
   // Expose
   global.TABS_EXT = TABS;
 })(window);
-}
