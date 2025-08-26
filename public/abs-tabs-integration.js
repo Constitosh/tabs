@@ -747,7 +747,6 @@ function renderBubbleGraph(rootEl, graph){
 const byAddr = new Map();
 const addNode = (n)=>{ const k=(n.address||'').toLowerCase(); if(!k||byAddr.has(k)) return; byAddr.set(k, n); };
 
-const A = snapshot.a || {};
 const B = snapshot.b || {};
 
 (A.holdersForBubbles||[]).forEach(h => addNode({ address:h.address, balance:h.balance, pct:h.pct, tags:[], label:null }));
