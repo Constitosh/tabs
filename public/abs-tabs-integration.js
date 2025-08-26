@@ -803,7 +803,7 @@
 const portal = `https://portal.abs.xyz/profile/${r.address}`;
 const abscan = `${EXPLORER}/address/${r.address}`;
 
-    return \`
+    return `
       <div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
         <div>
           <div class="addr mono" style="font-weight:700">\${r.address}</div>
@@ -819,7 +819,7 @@ const abscan = `${EXPLORER}/address/${r.address}`;
           <a class="btn mono" href="\${abscan}" target="_blank" rel="noopener">Explorer</a>
         </div>
       </div>
-    \`;
+    `;
   }).join('')}
   <div style="margin-top:10px; display:none">
     <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
