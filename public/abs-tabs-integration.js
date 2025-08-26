@@ -338,8 +338,12 @@
     }
 
      
-     // right after supply calculation
+// ===== Supply denominator (units) =====
+const currentSupplyUnits = mintedUnits >= burnedUnits ? (mintedUnits - burnedUnits) : 0n;
+// This denominator is used for all % calcs (holders + LP), so they always
+// sum to ~100% and never exceed it.
 const denomUnits = currentSupplyUnits;
+
 
      
 
@@ -819,60 +823,85 @@ function renderBubbleGraph(rootEl, graph){
     wire(buyersTop5()); wire(buyersRest());
   }
 
-  async function openFundersForRow(tr){
-    const addr = tr.getAttribute('data-addr'); const ts = Number(tr.getAttribute('data-ts')||0);
-    if (!addr) return;
-    showOverlay(fundersOverlay());
-    fundersInner().innerHTML = `<div class="banner mono"><span class="spinner"></span> Finding funding wallets (ETH + WETH)…</div>`;
-    setScanStatus('Finding funding wallets (ETH + WETH)…');
-    try{
-      const { addrs, info } = await getFundingWallets(addr, ts);
-      if (!addrs.length){ fundersInner().innerHTML = `<div class="banner mono">No inbound ETH/WETH before first token receipt.</div>`; return; }
-      const uniq = Array.from(new Set(addrs));
-      const scored=[];
-      for (const a of uniq){
-        const [ethBal, port] = await Promise.all([ apiBalance(a).catch(()=>0), tokenPortfolioUsd(a).catch(()=>({ totalUsd:0 })) ]);
-        if ((port.totalUsd||0) > IGNORE_FUNDER_OVER_USD) continue;
-        scored.push({ address:a, eth:ethBal, tokenUsd:port.totalUsd||0, meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0} });
-        await sleep(60);
-      }
+async function openFundersForRow(tr){
+  const addr = tr.getAttribute('data-addr'); 
+  const ts = Number(tr.getAttribute('data-ts')||0);
+  if (!addr) return;
 
-       // ...
-scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
-const top = scored.slice(0, TOP_FUNDER_LIMIT);
+  showOverlay(fundersOverlay());
+  fundersInner().innerHTML = `<div class="banner mono"><span class="spinner"></span> Finding funding wallets (ETH + WETH)…</div>`;
+  setScanStatus('Finding funding wallets (ETH + WETH)…');
 
-const cardsHtml = top.map((r) => {
-  const portal = `https://portal.abs.xyz/profile/${r.address}`;
-  const abscan = `${EXPLORER}/address/${r.address}`;
-  return [
-    '<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">',
-    '  <div>',
-    `    <div class="addr mono" style="font-weight:700">${r.address}</div>`,
-    '    <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">',
-    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>`,
-    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>`,
-    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>`,
-    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>`,
-    '    </div>',
-    '  </div>',
-    '  <div class="links" style="display:flex;gap:8px;flex-shrink:0">',
-    `    <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>`,
-    `    <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>`,
-    '  </div>',
-    '</div>'
-  ].join('');
-}).join('');
+  try{
+    const { addrs, info } = await getFundingWallets(addr, ts);
+    if (!addrs.length){
+      fundersInner().innerHTML = `<div class="banner mono">No inbound ETH/WETH before first token receipt.</div>`;
+      return;
+    }
 
-fundersInner().innerHTML = `
-  <div class="mono" style="margin-bottom:8px">
-    <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
-    Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
-  </div>
-  ${cardsHtml}
-  <div style="margin-top:10px; display:none">
-    <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
-  </div>
-`;
+    const uniq = Array.from(new Set(addrs));
+    const scored=[];
+    for (const a of uniq){
+      const [ethBal, port] = await Promise.all([
+        apiBalance(a).catch(()=>0),
+        tokenPortfolioUsd(a).catch(()=>({ totalUsd:0 }))
+      ]);
+      if ((port.totalUsd||0) > IGNORE_FUNDER_OVER_USD) continue;
+      scored.push({
+        address:a,
+        eth:ethBal,
+        tokenUsd:port.totalUsd||0,
+        meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0}
+      });
+      await sleep(60);
+    }
+
+    scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
+    const top = scored.slice(0, TOP_FUNDER_LIMIT);
+
+    const cardsHtml = top.map((r) => {
+      const portal = `https://portal.abs.xyz/profile/${r.address}`;
+      const abscan = `${EXPLORER}/address/${r.address}`;
+      return [
+        '<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">',
+        '  <div>',
+        `    <div class="addr mono" style="font-weight:700">${r.address}</div>`,
+        '    <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">',
+        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>`,
+        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>`,
+        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>`,
+        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>`,
+        '    </div>',
+        '  </div>',
+        '  <div class="links" style="display:flex;gap:8px;flex-shrink:0">',
+        `    <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>`,
+        `    <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>`,
+        '  </div>',
+        '</div>'
+      ].join('');
+    }).join('');
+
+    fundersInner().innerHTML = `
+      <div class="mono" style="margin-bottom:8px">
+        <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
+        Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
+      </div>
+      ${cardsHtml}
+      <div style="margin-top:10px; display:none">
+        <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
+      </div>
+    `;
+
+    const btn = document.getElementById('findCommonBtn');
+    if (btn) btn.onclick = () => findCommonFunders(top.map(x=>x.address));
+
+  } catch(e){
+    fundersInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`;
+  } finally {
+    setScanStatus('Done. Click a wallet row to view funders.');
+  }
+}
+
 
 
   async function findCommonFunders(addrs){
