@@ -24,7 +24,9 @@
 
   // Known proxy / TG bot routers (you can add more later)
   const KNOWN_PROXIES = new Set([
-    '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f' // Telegram bot (provided)
+    '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f',
+    '0x20BF96Ad879bA4D6904595ed05BC8d0Ce226B99a',
+    '0xcca5047E4C9f9D72F11C199B4ff1960f88A4748d' // Telegram bot (provided)
   ]);
   const FUNDING_WINDOW_SECS = 120 * 60;  // 120 minutes
 
@@ -284,7 +286,7 @@
 
 async function doFreshScan(contract){
   // Tweak these to trade accuracy vs speed
-  const VERIFY_TOP_LIMIT = 0;          // 0 = fastest (skip on-chain verify); 50 is a good compromise
+  const VERIFY_TOP_LIMIT = 50;          // 0 = fastest (skip on-chain verify); 50 is a good compromise
   const PROXY_MIN_RECIPIENTS = 2;      // how many distinct first-recipients needed to call a sender a "proxy/router"
   const result = { meta:{ contract }, a:{}, b:{} };
 
