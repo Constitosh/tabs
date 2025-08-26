@@ -282,61 +282,116 @@
     return { addrs:Array.from(merged.keys()), info:merged };
   }
 
-  // ======== Full token overview (scan) + save ========
-  async function doFreshScan(contract){
-    const result = { meta:{ contract }, a:{}, b:{} };
+async function doFreshScan(contract){
+  // Tweak these to trade accuracy vs speed
+  const VERIFY_TOP_LIMIT = 0;          // 0 = fastest (skip on-chain verify); 50 is a good compromise
+  const PROXY_MIN_RECIPIENTS = 2;      // how many distinct first-recipients needed to call a sender a "proxy/router"
+  const result = { meta:{ contract }, a:{}, b:{} };
 
-    setScanStatus('Downloading token transfer history…');
-    const txs = await fetchAllTokenTx(contract);
-    if (!txs.length) throw new Error('No transactions found for this token.');
-    const tokenDecimals = chooseDecimals(txs);
+  setScanStatus('Downloading token transfer history…');
+  const txs = await fetchAllTokenTx(contract);
+  if (!txs.length) throw new Error('No transactions found for this token.');
+  const tokenDecimals = chooseDecimals(txs);
 
-    setScanStatus('Resolving creator & supply metrics…');
-    let creatorAddress = '';
-    try{
-      const cRes = await fetch(`${BASE_URL}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${ETHERSCAN_API}`);
-      const cData = await cRes.json();
-      creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator) ? cData.result[0].contractCreator.toLowerCase() : '';
-    }catch{}
+  setScanStatus('Resolving creator & supply metrics…');
+  let creatorAddress = '';
+  try{
+    const cRes = await fetch(`${BASE_URL}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${ETHERSCAN_API}`);
+    const cData = await cRes.json();
+    creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator) ? cData.result[0].contractCreator.toLowerCase() : '';
+  }catch{}
 
-    // Supply + balances
-    const ZERO = '0x0000000000000000000000000000000000000000';
-    const DEAD = '0x000000000000000000000000000000000000dead';
-    const burnSet = new Set([ZERO, DEAD]);
+  // Supply + balances + first-in (sender included)
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  const DEAD = '0x000000000000000000000000000000000000dead';
+  const burnSet = new Set([ZERO, DEAD]);
 
-    const balances = {};
-    let mintedUnits=0n, burnedUnits=0n;
-    const firstInMap = new Map();
+  const balances = {};
+  let mintedUnits=0n, burnedUnits=0n;
+  const firstInMap = new Map();  // address -> { ts, v, from }
 
-    for (const t of txs){
-      const from=(t.from||t.fromAddress||'').toLowerCase(); const to=(t.to||t.toAddress||'').toLowerCase();
-      const v=toBI(t.value||'0'); const ts=Number(t.timeStamp)||0;
-      if (from===ZERO) mintedUnits+=v;
-      if (burnSet.has(to)) burnedUnits+=v;
-      if (from===contract || to===contract) continue; // ignore contract self-moves
-      if (!burnSet.has(from)) balances[from]=(balances[from]||0n)-v;
-      if (!burnSet.has(to))   balances[to]=(balances[to]||0n)+v;
-      if (!firstInMap.has(to) && !burnSet.has(to)) firstInMap.set(to, { ts, v });
+  for (const t of txs){
+    const from=(t.from||t.fromAddress||'').toLowerCase();
+    const to  =(t.to||t.toAddress||'').toLowerCase();
+    const v   = toBI(t.value||'0');
+    const ts  = Number(t.timeStamp)||0;
+
+    if (from===ZERO) mintedUnits+=v;
+    if (burnSet.has(to)) burnedUnits+=v;
+
+    // ignore contract self-moves
+    if (from===contract || to===contract) continue;
+
+    if (!burnSet.has(from)) balances[from]=(balances[from]||0n)-v;
+    if (!burnSet.has(to))   balances[to]=(balances[to]||0n)+v;
+
+    if (!firstInMap.has(to) && !burnSet.has(to)){
+      firstInMap.set(to, { ts, v, from });
     }
-    const currentSupplyUnits = mintedUnits>=burnedUnits ? (mintedUnits-burnedUnits) : 0n;
-    const currentSupply = Number(currentSupplyUnits)/(10**tokenDecimals);
+  }
 
-    // LP addresses and LP allocation (liquidity.base)
-    setScanStatus('Fetching LP pairs & allocation…');
-    let pairAddresses = await getPairAddresses(contract);
-    const lpAlloc = await getLPBaseAllocation(contract);
-    const pairSet = new Set(pairAddresses);
+  const currentSupplyUnits = mintedUnits>=burnedUnits ? (mintedUnits-burnedUnits) : 0n;
+  const currentSupply = Number(currentSupplyUnits)/(10**tokenDecimals);
 
-    setScanStatus('Building holders set…');
-    let holdersAll = Object.entries(balances)
-      .filter(([addr,bal])=> bal>0n && !burnSet.has(addr) && !pairSet.has(addr))
-      .map(([address,units])=>({ address, units }));
-    holdersAll.sort((a,b)=> (b.units>a.units) ? 1 : (b.units<a.units) ? -1 : 0);
+  // LP addresses + allocation from Dexscreener
+  setScanStatus('Fetching LP pairs & allocation…');
+  const pairAddresses = await (async()=>{
+    const out = new Set();
+    try{
+      const pr = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
+      const pd = await pr.json();
+      if (Array.isArray(pd)){
+        for (const p of pd){
+          let pa = String(p?.pairAddress||'').toLowerCase(); if (!pa) continue;
+          if (pa.includes(':')) pa = pa.split(':')[0];
+          if (/^0x[a-f0-9]{40}$/.test(pa)) out.add(pa);
+        }
+      }
+    }catch{}
+    return Array.from(out);
+  })();
+  const pairSet = new Set(pairAddresses);
 
-    // verify top balances against chain at head (top 150)
+  // From tokens/v1/abstract — sum of liquidity.base per pair
+  async function getLPBaseAllocation(contract){
+    const result = { baseSum: 0, perPair: new Map() };
+    try{
+      const r = await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${contract}`);
+      if (!r.ok) return result;
+      const arr = await r.json();
+      const flat = Array.isArray(arr) ? arr : [];
+      for (const t of flat){
+        const ps = Array.isArray(t?.pairs) ? t.pairs : (Array.isArray(t?.markets) ? t.markets : []);
+        for (const p of (ps||[])){
+          const base = Number(p?.liquidity?.base || 0);
+          const pa = String(p?.pairAddress || '').toLowerCase();
+          if (base > 0 && pa){
+            result.baseSum += base;
+            result.perPair.set(pa, (result.perPair.get(pa)||0) + base);
+          }
+        }
+      }
+    }catch{}
+    return result;
+  }
+  const lpAlloc = await getLPBaseAllocation(contract);
+
+  // Holders (exclude LP/zero/dead), sort, optional verify a few, then % and filter <0.001%
+  setScanStatus('Building holders set…');
+  let holdersAll = Object.entries(balances)
+    .filter(([addr,bal])=> bal>0n && !burnSet.has(addr) && !pairSet.has(addr))
+    .map(([address,units])=>({ address, units }));
+  holdersAll.sort((a,b)=> (b.units>a.units)?1:(b.units<a.units)?-1:0);
+
+  if (VERIFY_TOP_LIMIT > 0){
     setScanStatus('Verifying top balances…');
-    const toVerify = holdersAll.slice(0,150).map(h=>h.address); const verified={};
-    for (let i=0;i<toVerify.length;i++){ const a=toVerify[i]; verified[a]=await tokenBalanceOf(contract,a).catch(()=>null); await sleep(100); }
+    const toVerify = holdersAll.slice(0,VERIFY_TOP_LIMIT).map(h=>h.address);
+    const verified={};
+    for (let i=0;i<toVerify.length;i++){
+      const a=toVerify[i];
+      verified[a]=await tokenBalanceOf(contract,a).catch(()=>null);
+      await sleep(60);
+    }
     const vset=new Set(toVerify); const corrected=[];
     for (const h of holdersAll){
       if (vset.has(h.address)){
@@ -345,356 +400,342 @@
       } else corrected.push(h);
     }
     holdersAll = corrected; holdersAll.sort((a,b)=> (b.units>a.units)?1:(b.units<a.units)?-1:0);
-
-    // Map to bubble holders (cap at 500, filter <0.001%)
-    const holdersForBubblesRaw = holdersAll.slice(0,500).map(h=>{
-      const pct = currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0;
-      return { address:h.address, units:h.units, balance:Number(h.units)/(10**tokenDecimals), pct };
-    }).filter(h => (h.pct || 0) >= 0.001);
-
-    // Create LP node(s) from liquidity.base (allocation)
-    const lpNodes = [];
-    for (const pa of pairAddresses){
-      let base = lpAlloc.perPair.get(pa) || 0;
-      // Fallback to on-chain balance if API lacks base
-      if (!(base > 0)){
-        const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
-        base = Number(units)/(10**tokenDecimals);
-      }
-      const lpPct = currentSupply > 0 ? Math.max(0, (base / currentSupply) * 100) : 0;
-      lpNodes.push({ address:pa, balance:base, pct: lpPct, __type:'lp' });
-      await sleep(40);
-    }
-
-    const top10Pct = holdersForBubblesRaw.slice(0,10).reduce((s,h)=> s+(h.pct||0),0);
-    const creatorPct = creatorAddress ? (holdersForBubblesRaw.find(h=>h.address.toLowerCase()===creatorAddress)?.pct || 0) : 0;
-
-    // Detect proxy connections (txlistinternal)
-    setScanStatus('Scanning proxy connections (internal tx)…');
-    const viaProxyAddrs = [];
-    const graphEdges = [];
-    const KNOWN = KNOWN_PROXIES; // lowercase set
-    // Build a fast lookup of first-receipt times for funding window
-    const firstTs = new Map();
-    for (const [addr, obj] of firstInMap.entries()) firstTs.set(addr.toLowerCase(), Number(obj.ts)||0);
-
-    // Limit to speed (e.g., first 200 bubbles after filter)
-    const candidates = holdersForBubblesRaw.slice(0, 200);
-    for (const h of candidates){
-      const addr = h.address.toLowerCase();
-      const ts = firstTs.get(addr) || 0;
-      const winStart = ts ? (ts - FUNDING_WINDOW_SECS) : 0;
-      const winEnd   = ts ? (ts + FUNDING_WINDOW_SECS) : 0;
-      try{
-        const internals = await apiTxlistinternal(addr, { startblock:0, endblock:99999999 }).catch(()=>[]);
-        let tagged = false;
-        for (const it of internals){
-          const from = String(it.from||'').toLowerCase();
-          const to   = String(it.to||'').toLowerCase();
-          const tts  = Number(it.timeStamp||0);
-          if (KNOWN.has(from) && to === addr){
-            if (!ts || (tts>=winStart && tts<=winEnd)){
-              viaProxyAddrs.push(addr);
-              graphEdges.push({ type:'proxy', source: from, target: addr, weight: 2 });
-              tagged = true;
-              break;
-            }
-          }
-        }
-        // small breath between calls
-        await sleep(60);
-        if (tagged) continue;
-      }catch{}
-    }
-
-    // A (stats + bubble inputs)
-    const holdersForBubbles = holdersForBubblesRaw.map(h => ({
-      address: h.address,
-      balance: h.balance,
-      pct: h.pct
-    }));
-
-    result.a = {
-      contract,
-      tokenDecimals,
-      minted: Number(mintedUnits)/(10**tokenDecimals),
-      burned: Number(burnedUnits)/(10**tokenDecimals),
-      currentSupply,
-      currentSupplyUnits: String(currentSupplyUnits),
-      totalHolders: holdersAll.length,
-      top10Pct,
-      creatorAddress,
-      creatorPct,
-      holdersForBubbles,
-      lpNodes,
-      viaProxyAddrs,
-      graphEdges
-    };
-
-    // B (holders + receivers)
-    setScanStatus('Fetching Transfer logs…');
-    const receivers = await getFirst27Receivers(contract);
-    const enriched=[];
-    setScanStatus('Computing totals & statuses per wallet…');
-    for (const r of receivers){
-      const st = await enrichReceiverStats(contract, r).catch(()=>null);
-      if (st) enriched.push(st);
-      await sleep(50);
-    }
-
-    const top25 = holdersAll.slice(0,25).map((h,i)=>{
-      const first = firstInMap.get(h.address) || { ts:0, v:0n };
-      return {
-        rank: i+1,
-        address: h.address,
-        firstIn: Number(first.v)/(10**tokenDecimals),
-        holdings: Number(h.units)/(10**tokenDecimals),
-        pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
-      };
-    });
-
-    result.b = { first25: enriched.slice(0,25), top25 };
-
-    // done
-    return result;
   }
 
-  // ======== Bubble graph builder + renderer ========
-  function buildGraphFromScan(A, B){
-    const holderNodes = (A.holdersForBubbles || []).map(h => ({
-      address: h.address,
-      balance: Number(h.balance || 0),
-      pct: Number(h.pct || 0),
-      tags: [],
-      label: null
-    }));
+  // Map -> holdersForBubbles (cap 500; hide <0.001%)
+  const holdersForBubblesRaw = holdersAll.slice(0, 700).map(h=>{
+    const pct = currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0;
+    return { address:h.address, units:h.units, balance:Number(h.units)/(10**tokenDecimals), pct };
+  }).filter(h => (h.pct || 0) >= 0.001).slice(0, 500);
 
-    const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
-
-    // LP nodes
-    for (const lp of (A.lpNodes || [])){
-      const key = String(lp.address||'').toLowerCase();
-      if (!byAddr.has(key)){
-        byAddr.set(key, { address:key, balance:Number(lp.balance||0), pct:Number(lp.pct||0), tags:['lp'], label:'LP' });
-      }else{
-        const n = byAddr.get(key);
-        n.tags = n.tags || [];
-        if (!n.tags.includes('lp')) n.tags.push('lp');
-        if (!n.label) n.label = 'LP';
-        n.pct = Number(lp.pct || n.pct || 0);
-        n.balance = Number(lp.balance || n.balance || 0);
-      }
+  // LP nodes from Dexscreener 'liquidity.base' (fallback to on-chain balance)
+  const lpNodes = [];
+  for (const pa of pairAddresses){
+    let base = lpAlloc.perPair.get(pa) || 0;
+    if (!(base>0)){
+      const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
+      base = Number(units)/(10**tokenDecimals);
     }
+    const lpPct = currentSupply > 0 ? (base / currentSupply) * 100 : 0;
+    if (lpPct > 0) lpNodes.push({ address:pa, balance:base, pct: lpPct, __type:'lp' });
+    await sleep(30);
+  }
 
-    // Creator tag
-    if (A.creatorAddress){
-      const key = String(A.creatorAddress).toLowerCase();
-      const n = byAddr.get(key);
-      if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); if (!n.label) n.label = 'CREATOR'; }
+  const top10Pct = holdersForBubblesRaw.slice(0,10).reduce((s,h)=> s+(h.pct||0),0);
+  const creatorPct = creatorAddress ? (holdersForBubblesRaw.find(h=>h.address.toLowerCase()===creatorAddress)?.pct || 0) : 0;
+
+  // ========= Proxy / connection detection (fast, no extra API calls) =========
+  // We infer proxies by the "first inbound token transfer sender".
+  // If the same sender appears as the first-sender for >= PROXY_MIN_RECIPIENTS holders,
+  // we tag those recipients as 'via-proxy' and group them by that sender.
+  const candidateSet = new Set(holdersForBubblesRaw.map(h=>h.address.toLowerCase()));
+  const firstSenderCounts = new Map();     // sender -> { list:[{to,ts}], count }
+  const holderFirstSender = new Map();     // holder -> sender (if known)
+
+  for (const h of holdersForBubblesRaw){
+    const rec = firstInMap.get(h.address);
+    if (!rec) continue;
+    const sender = String(rec.from||'').toLowerCase();
+    if (!sender || sender===ZERO || sender===DEAD || sender===contract) continue;
+    holderFirstSender.set(h.address.toLowerCase(), sender);
+    const o = firstSenderCounts.get(sender) || { list:[], count:0, minTs: Infinity, maxTs: -Infinity };
+    o.list.push({ to: h.address.toLowerCase(), ts: Number(rec.ts)||0 });
+    o.count += 1;
+    o.minTs = Math.min(o.minTs, Number(rec.ts)||0);
+    o.maxTs = Math.max(o.maxTs, Number(rec.ts)||0);
+    firstSenderCounts.set(sender, o);
+  }
+
+  // Build proxy set: known proxies OR natural clusters (>= min recipients and within ~4h span)
+  const proxySet = new Set([...KNOWN_PROXIES]);
+  for (const [sender,info] of firstSenderCounts.entries()){
+    if (info.count >= PROXY_MIN_RECIPIENTS && (info.maxTs - info.minTs) <= (FUNDING_WINDOW_SECS*2)){
+      proxySet.add(sender);
     }
+  }
 
-    // Proxy tag
-    const via = new Set((A.viaProxyAddrs||[]).map(a=>String(a).toLowerCase()));
-    for (const [k,n] of byAddr.entries()){
-      if (via.has(k)){ n.tags = n.tags || []; if(!n.tags.includes('via-proxy')) n.tags.push('via-proxy'); }
+  // Map holder -> proxyId (if sender in proxy set)
+  const proxyMap = {};
+  const viaProxyAddrs = [];
+  for (const [holder, sender] of holderFirstSender.entries()){
+    if (proxySet.has(sender)){
+      proxyMap[holder] = sender;
+      viaProxyAddrs.push(holder);
     }
+  }
 
-    // Peak/Left for everyone:
-    // - If we have B.first25 enriched stats, use totalIn/holdings.
-    // - Otherwise, fallback: peak = current balance; left = 100%.
-    const first25By = new Map((B.first25||[]).map(r => [String(r.address).toLowerCase(), r]));
-    const top25By   = new Map((B.top25||[]).map(r => [String(r.address).toLowerCase(), r]));
-    for (const [k,n] of byAddr.entries()){
-      const r = first25By.get(k) || top25By.get(k);
-      let peak, leftTokens, leftPct;
-      if (r){
-        const totIn = Number(r.totalIn || r.firstIn || 0);
-        const cur   = Number(r.holdings || n.balance || 0);
-        peak = Math.max(totIn, cur);
-        leftTokens = cur;
-        leftPct = peak>0 ? (cur/peak)*100 : 0;
-      }else{
-        // best-effort fallback
-        peak = Number(n.balance||0);
-        leftTokens = Number(n.balance||0);
-        leftPct = peak>0 ? 100 : 0;
-      }
-      n.peakTokens = peak;
-      n.leftTokens = leftTokens;
-      n.leftPct    = leftPct;
-    }
+  // ========= Save "A" (stats + bubble inputs) =========
+  const holdersForBubbles = holdersForBubblesRaw.map(h => ({
+    address: h.address,
+    balance: h.balance,
+    pct: h.pct
+  }));
 
-    const edges = Array.isArray(A.graphEdges) ? A.graphEdges.slice() : [];
+  result.a = {
+    contract,
+    tokenDecimals,
+    minted: Number(mintedUnits)/(10**tokenDecimals),
+    burned: Number(burnedUnits)/(10**tokenDecimals),
+    currentSupply,
+    currentSupplyUnits: String(currentSupplyUnits),
+    totalHolders: holdersAll.length,
+    top10Pct,
+    creatorAddress,
+    creatorPct,
+    holdersForBubbles,
+    lpNodes,
+    viaProxyAddrs,
+    proxyMap    // <-- holder(lowercase) -> proxy(lowercase)
+  };
 
+  // ===== B (holders + receivers) — keep as you had =====
+  setScanStatus('Fetching Transfer logs…');
+  const receivers = await getFirst27Receivers(contract);
+  const enriched=[];
+  setScanStatus('Computing totals & statuses per wallet…');
+  for (const r of receivers){
+    const st = await enrichReceiverStats(contract, r).catch(()=>null);
+    if (st) enriched.push(st);
+    await sleep(50);
+  }
+
+  const top25 = holdersAll.slice(0,25).map((h,i)=>{
+    const first = firstInMap.get(h.address) || { ts:0, v:0n };
     return {
-      explorer: EXPLORER,
-      nodes: Array.from(byAddr.values()),
-      edges
+      rank: i+1,
+      address: h.address,
+      firstIn: Number(first.v)/(10**tokenDecimals),
+      holdings: Number(h.units)/(10**tokenDecimals),
+      pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
     };
+  });
+
+  result.b = { first25: enriched.slice(0,25), top25 };
+  return result;
+}
+
+
+function buildGraphFromScan(A, B){
+  // Base nodes
+  const holderNodes = (A.holdersForBubbles || []).map(h => ({
+    address: h.address,
+    balance: Number(h.balance || 0),
+    pct: Number(h.pct || 0),
+    tags: [],
+    label: null,
+    proxyId: null,
+    peakTokens: Number(h.balance || 0), // fallback; improved below if we have B data
+    leftTokens: Number(h.balance || 0),
+    leftPct: 100
+  }));
+
+  const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
+
+  // LP nodes
+  for (const lp of (A.lpNodes || [])){
+    const key = String(lp.address||'').toLowerCase();
+    if (!byAddr.has(key)){
+      byAddr.set(key, { address:key, balance:Number(lp.balance||0), pct:Number(lp.pct||0), tags:['lp'], label:'LP', proxyId:null, peakTokens:Number(lp.balance||0), leftTokens:Number(lp.balance||0), leftPct:100 });
+    }else{
+      const n = byAddr.get(key);
+      n.tags = n.tags || []; if (!n.tags.includes('lp')) n.tags.push('lp');
+      if (!n.label) n.label = 'LP';
+      n.pct = Number(lp.pct || n.pct || 0);
+      n.balance = Number(lp.balance || n.balance || 0);
+    }
   }
 
-  function renderBubbleGraph(rootEl, graph){
-    const EX = graph.explorer || 'https://abscan.org';
-    const nodes = (graph.nodes || []).slice(0, 500);
-    const edges = graph.edges || [];
+  // Creator tag
+  if (A.creatorAddress){
+    const key = String(A.creatorAddress).toLowerCase();
+    const n = byAddr.get(key);
+    if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); if (!n.label) n.label = 'CREATOR'; }
+  }
 
-    rootEl.innerHTML = '';
-    const width  = rootEl.clientWidth || 960;
-    const height = Math.max(560, Math.round(width * 0.48));
+  // Proxy tags (group by proxyId)
+  const pmap = A.proxyMap || {};
+  for (const [holderLower, proxyLower] of Object.entries(pmap)){
+    const n = byAddr.get(holderLower);
+    if (n){
+      n.proxyId = String(proxyLower);
+      n.tags = n.tags || [];
+      if (!n.tags.includes('via-proxy')) n.tags.push('via-proxy');
+    }
+  }
 
-    const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
-    const rootG = svg.append('g');
-    const linkG = rootG.append('g').attr('class','links');
-    const nodeG = rootG.append('g').attr('class','nodes');
+  // Peak/Left for everyone if we have B stats for some
+  const first25By = new Map((B.first25||[]).map(r => [String(r.address).toLowerCase(), r]));
+  const top25By   = new Map((B.top25||[]).map(r => [String(r.address).toLowerCase(), r]));
+  for (const [k,n] of byAddr.entries()){
+    const r = first25By.get(k) || top25By.get(k);
+    if (r){
+      const totIn = Number(r.totalIn || r.firstIn || 0);
+      const cur   = Number(r.holdings || n.balance || 0);
+      const peak  = Math.max(totIn, cur);
+      n.peakTokens = peak;
+      n.leftTokens = cur;
+      n.leftPct    = peak>0 ? (cur/peak)*100 : 0;
+    }
+  }
 
-    const roleColor = (tags=[]) => {
-      const set = new Set(tags.map(t => String(t).toLowerCase()));
-      if (set.has('lp'))      return '#8b5cf6';  // LP
-      return '#375a4e';                         // default holders & creator
-    };
-    const roleStroke = (tags=[]) => {
-      const set = new Set(tags.map(t => String(t).toLowerCase()));
-      if (set.has('lp')) return '#c4b5fd';
-      return 'rgba(0,0,0,.35)';
-    };
+  return {
+    explorer: EXPLORER,
+    nodes: Array.from(byAddr.values())
+  };
+}
 
-    // radius by % of supply (sqrt) — biggest centered later via forces
-    const maxPct = Math.max(0.0001, ...nodes.map(n => +n.pct || 0));
-    const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
-    nodes.forEach(n => { n.r = rScale(+n.pct || 0); if (!n.tags) n.tags = []; });
 
-    // initial seeds using pack
-    const pack = d3.pack().size([width, height]).padding(3);
-    const pRoot = d3.hierarchy({ children: nodes }).sum(d => (d && d.r ? d.r * d.r : 1));
-    const leaves = pack(pRoot).leaves();
-    const addrKey = a => String(a||'').toLowerCase();
-    const seed   = new Map(leaves.map(l => [addrKey(l.data.address), l]));
-    nodes.forEach(n => { const s = seed.get(addrKey(n.address)); n.x = s ? s.x : Math.random()*width; n.y = s ? s.y : Math.random()*height; });
+function renderBubbleGraph(rootEl, graph){
+  const EX = graph.explorer || 'https://abscan.org';
+  const allNodes = (graph.nodes || []);
+  // Split into holders vs LPs
+  const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
+  const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp'));
 
-    // biggest to center + gentle drift
-    const cx = width/2, cy = height/2;
-    const maxR = Math.max(...nodes.map(n => n.r || 0), 1);
-    const nSize = d => Math.max(0, Math.min(1, (d.r || 1)/maxR));
-    const centerStrength = d => 0.06 + 0.18 * ((nSize(d) - 0.3) / 0.7);
+  rootEl.innerHTML = '';
+  const width  = rootEl.clientWidth || 960;
+  const height = Math.max(560, Math.round(width * 0.48));
 
-    const sim = d3.forceSimulation(nodes)
-      .alpha(0.9)
-      .velocityDecay(0.35)                 // “space drift”
-      .force('collide', d3.forceCollide(d => Math.max(6, d.r)).strength(0.9))
-      .force('x', d3.forceX(cx).strength(d => centerStrength(d)))
-      .force('y', d3.forceY(cy).strength(d => centerStrength(d)))
-      .on('tick', ticked);
+  const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+  const rootG = svg.append('g');
 
-    nodes.forEach(n => { n.vx = (Math.random()-0.5)*0.3; n.vy = (Math.random()-0.5)*0.3; });
+  // Colors
+  const FILL_HOLDER = '#375a4e';
+  const FILL_LP     = '#8b5cf6';
+  const STROKE_LP   = '#c4b5fd';
+  const STROKE_DEF  = 'rgba(0,0,0,.35)';
+  const STROKE_PROXY= '#ffd54a';
 
-    // zoom/pan
-    const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
-    svg.call(zoom);
-    svg.on('mousedown.stop-sim', () => sim.alphaTarget(0).stop());
+  const addrKey = a => String(a||'').toLowerCase();
 
-    // edges (proxy etc.)
-    const linkSel = linkG.selectAll('line').data(edges, d => `${d.source}|${d.target}|${d.type}`).join('line')
-      .attr('stroke', d => d.type === 'proxy' ? '#ffd54a' : '#89b6a0')
-      .attr('stroke-opacity', d => d.type === 'proxy' ? 0.9 : 0.25)
-      .attr('stroke-width', d => Math.max(1.5, d.weight || 1.5));
+  // Radius by % of supply (sqrt)
+  const maxPct = Math.max(0.0001, ...holders.map(n => +n.pct || 0), ...lps.map(n => +n.pct || 0));
+  const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
+  holders.forEach(n => n.r = rScale(+n.pct || 0));
+  lps.forEach(n => n.r = rScale(+n.pct || 0));
 
-    // nodes
-    const nodeSel = nodeG.selectAll('g.node').data(nodes, d => d.address).join(enter => {
-      const g = enter.append('g').attr('class','node').attr('transform', d => `translate(${d.x},${d.y})`).style('cursor','pointer');
+  // ====== PACK the holders into a tight circle (design like your screenshot)
+  const pack = d3.pack().size([width*0.8, height*0.9]).padding(3);
+  const pRoot = d3.hierarchy({ children: holders }).sum(d => (d && d.r ? d.r * d.r : 1));
+  const leaves = pack(pRoot).leaves();
+  const seed   = new Map(leaves.map(l => [addrKey(l.data.address), l]));
+  holders.forEach(n => { const s = seed.get(addrKey(n.address)); n.x = s ? s.x : 0; n.y = s ? s.y : 0; });
 
-      g.append('circle')
-        .attr('r', d => Math.max(8, d.r || 8))
-        .attr('fill', d => roleColor(d.tags))
-        .attr('fill-opacity', 0.95)
-        .attr('stroke', d => roleStroke(d.tags)).attr('stroke-width', d => (d.tags||[]).includes('lp') ? 2.5 : 1);
+  // Center the holder cluster
+  const HBOX = { x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
+                 x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r) };
+  HBOX.w = HBOX.x2 - HBOX.x; HBOX.h = HBOX.y2 - HBOX.y;
 
-      // proxy ring (always visible if tagged)
-      g.append('circle')
-        .attr('class','proxy-ring')
-        .attr('r', d => Math.max(8, d.r || 8) + 2)
-        .attr('fill', 'none')
-        .attr('stroke', d => {
-          const tags = (d.tags||[]).map(t => String(t).toLowerCase());
-          return (tags.includes('proxy') || tags.includes('via-proxy')) ? '#ffd54a' : 'none';
-        })
-        .attr('stroke-width', 2);
+  // ====== Place LP bubbles OUTSIDE on the right, vertically stacked
+  const lpGap = 18;
+  const lpAreaX = HBOX.x2 + lpGap + (width*0.05);
+  let lpY = HBOX.y + 20;
+  lps.forEach(n => {
+    n.x = lpAreaX + n.r;
+    n.y = lpY + n.r;
+    lpY += n.r*2 + 18;
+  });
 
-      // % label
-      g.append('text')
-        .text(d => `${(+d.pct || 0).toFixed(2)}%`)
-        .attr('text-anchor','middle').attr('dy','0.32em')
-        .attr('font-size', d => Math.max(9, Math.min(12, (d.r||12)/3 + 7)))
-        .attr('pointer-events','none')
-        .attr('fill','rgba(0,0,0,.85)');
+  // Now compute overall bbox for fit
+  const ALL = holders.concat(lps);
+  const BBOX = {
+    x: d3.min(ALL, n=>n.x - n.r), y: d3.min(ALL, n=>n.y - n.r),
+    x2: d3.max(ALL, n=>n.x + n.r), y2: d3.max(ALL, n=>n.y + n.r)
+  };
+  BBOX.w = BBOX.x2 - BBOX.x; BBOX.h = BBOX.y2 - BBOX.y;
 
-      g.on('click', (ev,d)=> window.open(`${EX}/address/${d.address}`, '_blank'));
+  // Zoom (no simulation)
+  const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
+  svg.call(zoom);
 
-      const tip = getTip();
-      g.on('mouseenter', (ev,d)=>{
-        const tags = d.tags && d.tags.length ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : '';
-        const peakTokens = isFinite(d.peakTokens) ? d.peakTokens : null;
-        const leftTokens = isFinite(d.leftTokens) ? d.leftTokens : null;
-        const leftPct    = isFinite(d.leftPct) ? d.leftPct : null;
-        const peakHtml = `<div><b>Peak held:</b> ${peakTokens!=null ? fmtNum(peakTokens,6) : '—'} tokens</div>`;
-        const leftHtml = `<div><b>Left:</b> ${leftTokens!=null ? fmtNum(leftTokens,6) : '—'} tokens${leftPct!=null ? ` (${leftPct.toFixed(1)}%)` : ''}</div>`;
-        tip.html(`
-          <div style="font-weight:700;margin-bottom:4px">${(+d.pct||0).toFixed(2)}% of supply</div>
-          <div><b>Address:</b> ${d.address}</div>
-          ${peakHtml}${leftHtml}${tags}
-          <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
-        `).style('opacity',1);
-      }).on('mousemove', (ev)=>{
-        const x = ev.clientX+12, y = ev.clientY+12;
-        getTip().style('left', x+'px').style('top', y+'px');
-      }).on('mouseleave', ()=> getTip().style('opacity',0));
+  // Draw nodes
+  const nodeSel = rootG.selectAll('g.node').data(ALL, d => d.address).join(enter => {
+    const g = enter.append('g').attr('class','node').attr('transform', d => `translate(${d.x},${d.y})`).style('cursor','pointer');
 
-      return g;
+    // Base circle
+    g.append('circle')
+      .attr('r', d => Math.max(8, d.r || 8))
+      .attr('fill', d => (d.tags||[]).includes('lp') ? FILL_LP : FILL_HOLDER)
+      .attr('fill-opacity', 0.95)
+      .attr('stroke', d => (d.tags||[]).includes('lp') ? STROKE_LP : ((d.tags||[]).includes('via-proxy') ? STROKE_PROXY : STROKE_DEF))
+      .attr('stroke-width', d => (d.tags||[]).includes('lp') ? 2.5 : ((d.tags||[]).includes('via-proxy') ? 2.5 : 1));
+
+    // % label (or LP)
+    g.append('text')
+      .text(d => (d.tags||[]).includes('lp') ? 'LP' : `${(+d.pct || 0).toFixed(2)}%`)
+      .attr('text-anchor','middle').attr('dy','0.32em')
+      .attr('font-size', d => Math.max(10, Math.min(14, (d.r||14)/3 + 8)))
+      .attr('pointer-events','none')
+      .attr('fill','rgba(255,255,255,.88)');
+
+    // Hover behavior: highlight same proxy group (no lines)
+    const tip = getTip();
+    g.on('mouseenter', (ev,d)=>{
+      if (d.proxyId){
+        nodeSel.selectAll('circle').attr('opacity', n => (n.proxyId && n.proxyId===d.proxyId) ? 1 : 0.35);
+        nodeSel.selectAll('circle')
+          .attr('stroke-width', n => (n.proxyId && n.proxyId===d.proxyId) ? 4 : ((n.tags||[]).includes('lp') ? 2.5 : ((n.tags||[]).includes('via-proxy') ? 2.5 : 1)));
+      }
+      const peakTokens = isFinite(d.peakTokens) ? d.peakTokens : null;
+      const leftTokens = isFinite(d.leftTokens) ? d.leftTokens : null;
+      const leftPct    = isFinite(d.leftPct) ? d.leftPct : null;
+      tip.html(`
+        <div style="font-weight:700;margin-bottom:4px">${(d.tags||[]).includes('lp') ? 'LP' : ((+d.pct||0).toFixed(2)+'% of supply')}</div>
+        <div><b>Address:</b> ${d.address}</div>
+        <div><b>Peak held:</b> ${peakTokens!=null ? fmtNum(peakTokens,6) : '—'} tokens</div>
+        <div><b>Left:</b> ${leftTokens!=null ? fmtNum(leftTokens,6) : '—'} tokens${leftPct!=null ? ` (${leftPct.toFixed(1)}%)` : ''}</div>
+        ${(d.tags && d.tags.length) ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : ''}
+        ${d.proxyId ? `<div class="mono" style="opacity:.85">Proxy group: ${d.proxyId}</div>` : ''}
+        <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
+      `).style('opacity',1);
+    }).on('mousemove', (ev)=>{
+      getTip().style('left', (ev.clientX+12)+'px').style('top', (ev.clientY+12)+'px');
+    }).on('mouseleave', ()=>{
+      nodeSel.selectAll('circle').attr('opacity', 1)
+        .attr('stroke-width', n => (n.tags||[]).includes('lp') ? 2.5 : ((n.tags||[]).includes('via-proxy') ? 2.5 : 1));
+      getTip().style('opacity',0);
     });
 
-    // fit to view
-    fitToView();
-    function fitToView(){
-      const bbox = nodeG.node().getBBox();
-      const pad = 28;
-      const k = Math.min(
-        (width  - pad*2) / Math.max(1, bbox.width),
-        (height - pad*2) / Math.max(1, bbox.height)
-      );
-      const scale = Math.max(0.7, Math.min(3, k));
-      const tx = (width  - scale*(bbox.x + bbox.width/2));
-      const ty = (height - scale*(bbox.y + bbox.height/2));
-      svg.transition().duration(450).call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-    }
+    g.on('click', (ev,d)=> window.open(`${EX}/address/${d.address}`, '_blank'));
+    return g;
+  });
 
-    function ticked(){
-      nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
-      linkSel
-        .attr('x1', d => pos(d.source).x).attr('y1', d => pos(d.source).y)
-        .attr('x2', d => pos(d.target).x).attr('y2', d => pos(d.target).y);
-    }
-    const index = new Map(nodes.map(n => [addrKey(n.address), n]));
-    function pos(a){ const n = index.get(addrKey(a)); return n || { x: cx, y: cy }; }
-
-    function getTip(){
-      let tip = d3.select('#bubble-tip');
-      if (tip.empty()){
-        tip = d3.select('body').append('div').attr('id','bubble-tip')
-          .style('position','fixed').style('background','#111').style('color','#fff')
-          .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
-          .style('pointer-events','none').style('opacity',0).style('z-index',9999)
-          .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
-      }
-      return tip;
-    }
-    function fmtNum(n, d=4){
-      if (!isFinite(n)) return '0';
-      const abs = Math.abs(n);
-      if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-      if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-      if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'k';
-      return Number(n).toLocaleString(undefined, { maximumFractionDigits: d });
-    }
+  // Initial fit-to-view (holders + LP column)
+  fitToView();
+  function fitToView(){
+    const bbox = rootG.node().getBBox();
+    const pad = 24;
+    const k = Math.min(
+      (width  - pad*2) / Math.max(1, bbox.width),
+      (height - pad*2) / Math.max(1, bbox.height)
+    );
+    const scale = Math.max(0.7, Math.min(3, k));
+    const tx = (width  - scale*(bbox.x + bbox.width/2));
+    const ty = (height - scale*(bbox.y + bbox.height/2));
+    svg.transition().duration(450).call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
   }
+
+  function getTip(){
+    let tip = d3.select('#bubble-tip');
+    if (tip.empty()){
+      tip = d3.select('body').append('div').attr('id','bubble-tip')
+        .style('position','fixed').style('background','#111').style('color','#fff')
+        .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
+        .style('pointer-events','none').style('opacity',0).style('z-index',9999)
+        .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
+    }
+    return tip;
+  }
+  function fmtNum(n, d=4){
+    if (!isFinite(n)) return '0';
+    const abs = Math.abs(n);
+    if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'k';
+    return Number(n).toLocaleString(undefined, { maximumFractionDigits: d });
+  }
+}
+
 
   // ======== Container B rendering (unchanged) ========
   function renderStatusGrid(list25){
