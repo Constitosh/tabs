@@ -341,6 +341,10 @@
     const denomUnits = Object.entries(balances)
       .reduce((acc,[addr,bi]) => acc + (bi>0n ? bi : 0n), 0n);
 
+     // right after supply calculation
+const denomUnits = currentSupplyUnits;
+
+
     // LP addresses & allocation
     setScanStatus('Fetching LP pairs & allocation…');
     const pairAddresses = await getPairAddresses(contract);
@@ -496,22 +500,20 @@
     result.b = { first25: enriched, top25 };
     return result;
   }
-   }
 
   function buildGraphFromScan(A, B){
-    const holderNodes = (A.holdersForBubbles || []).map(h => ({
-      address: h.address,
-      balance: Number(h.balance || 0),
-      pct: Number(h.pct || 0),
-      tags: [],
-      label: null,
-      proxyId: null,       // via proxy groups (stroke color)
-      connectId: null,     // shared funder groups (fill color)
-      peakTokens: Number(h.balance || 0),
-      leftTokens: Number(h.balance || 0),
-      leftPct: 100
-    }
-    }));
+const holderNodes = (A.holdersForBubbles || []).map(h => ({
+  address: h.address,
+  balance: Number(h.balance || 0),
+  pct: Number(h.pct || 0),
+  tags: [],
+  label: null,
+  proxyId: null,       // via proxy groups (stroke color)
+  connectId: null,     // shared funder groups (fill color)
+  peakTokens: Number(h.balance || 0),
+  leftTokens: Number(h.balance || 0),
+  leftPct: 100
+}));
 
     const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
 
