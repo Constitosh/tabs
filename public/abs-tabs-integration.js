@@ -666,7 +666,7 @@ function renderBubbleGraph(rootEl, graph){
   const cx = width * 0.4, cy = height * 0.5;
   const maxR = Math.max(...holders.map(n => n.r||0), 1);
   const sizeNorm = d => Math.max(0, Math.min(1, (d.r||1)/maxR));
-  const centerStrength = d => 0.03 + 0.22 * Math.pow(sizeNorm(d), 1.25); // small → weak pull, big → strong pull
+  const centerStrength = d => 0.03 + 0.32 * Math.pow(sizeNorm(d), 1.25); // small → weak pull, big → strong pull
 
   const sim = d3.forceSimulation(holders)
     .alpha(1)
