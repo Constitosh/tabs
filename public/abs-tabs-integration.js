@@ -564,66 +564,85 @@
     return { explorer: EXPLORER, nodes: Array.from(byAddr.values()) };
   }
 
-  function renderBubbleGraph(rootEl, graph){
+function renderBubbleGraph(rootEl, graph){
+  try {
     const EX = graph.explorer || 'https://abscan.org';
-    const allNodes = (graph.nodes || []);
+    const allNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    // holders only in main ball
     const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
     const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp'));
 
+    // normalize numbers (protect against NaN)
+    holders.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
+    lps.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
+
+    // cap/normalize tiny rounding so total never exceeds 100%
+    const pctSum = holders.reduce((s,n)=>s+n.pct,0);
+    if (pctSum > 100.0001) {
+      const k = 100 / pctSum;
+      holders.forEach(n => n.pct *= k);
+    }
+
     rootEl.innerHTML = '';
     const width  = rootEl.clientWidth || 960;
-    const height = Math.max(560, Math.round(width * 0.52));
+    const height = Math.max(560, Math.round(width * 0.56));
 
-    const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+    const svg   = d3.select(rootEl).append('svg')
+      .attr('width', width)
+      .attr('height', height)
+      .style('cursor','grab');
     const rootG = svg.append('g');
 
-    // Colors
-    const FILL_HOLDER  = '#375a4e';
-    const FILL_LP      = '#8b5cf6';
-    const STROKE_LP    = '#c4b5fd';
-    const STROKE_DEF   = 'rgba(0,0,0,.38)';
+    // colors
+    const FILL_HOLDER = '#375a4e';
+    const FILL_CONN   = '#0ea5a8';   // filled for shared funder group
+    const FILL_CREATOR= '#f59e0b';   // creator bubble fill (orange)
+    const STROKE_DEF  = 'rgba(0,0,0,.35)';
 
-    // per-proxy stroke color
-    const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>n.proxyId)));
+    // per-proxy stroke palette
+    const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>String(n.proxyId))));
     const proxyColor = d3.scaleOrdinal()
       .domain(proxyIds)
-      .range(['#f59e0b','#60a5fa','#ef4444','#10b981','#a78bfa','#f472b6','#22d3ee','#f43f5e','#34d399','#eab308','#38bdf8','#fb7185','#84cc16','#c084fc']);
+      .range([
+        '#f59e0b','#60a5fa','#ef4444','#10b981','#a78bfa',
+        '#f472b6','#22d3ee','#f43f5e','#34d399','#eab308',
+        '#38bdf8','#fb7185','#84cc16','#c084fc'
+      ]);
 
-    // per-shared-funder fill color
-    const funderIds = Array.from(new Set(holders.filter(n=>n.connectId && !n.proxyId).map(n=>n.connectId)));
-    const funderColor = d3.scaleOrdinal()
-      .domain(funderIds)
-      .range(['#1e293b','#0f766e','#334155','#155e75','#3f3f46','#14532d','#3b0764','#3d1d7a','#374151','#064e3b']);
-
-    // Radius (sqrt on %)
-    const maxPct = Math.max(0.0001, ...holders.map(n => +n.pct || 0), ...lps.map(n => +n.pct || 0));
+    // radius scale
+    const maxPct = Math.max(0.0001, ...holders.map(n => n.pct), ...lps.map(n => n.pct));
     const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
-    holders.forEach(n => n.r = rScale(+n.pct || 0));
-    lps.forEach(n => n.r = rScale(+n.pct || 0));
+    holders.forEach(n => n.r = rScale(n.pct));
+    lps.forEach(n => n.r = rScale(n.pct));
 
-    // Pack seed (bigger trend to center)
-    const pack = d3.pack().size([width*0.78, height*0.90]).padding(8);
-    const pRoot = d3.hierarchy({ children: holders }).sum(d => (d && d.r ? d.r * d.r : 1));
-    const leaves = pack(pRoot).leaves();
-    const seed   = new Map(leaves.map(l => [String(l.data.address).toLowerCase(), l]));
-    holders.forEach(n => { const s = seed.get(String(n.address).toLowerCase()); n.x = s ? s.x : 0; n.y = s ? s.y : 0; });
+    // seeds from a pack (bigger tend to center)
+    const pack = d3.pack().size([width * 0.78, height * 0.9]).padding(7);
+    const pRoot = d3.hierarchy({ children: holders }).sum(node => {
+      const rr = (node && node.r) ? node.r : 1; return rr * rr;
+    });
+    const seedMap = new Map(pack(pRoot).leaves().map(l => [String(l.data.address).toLowerCase(), {x:l.x, y:l.y}]));
+    holders.forEach(n => {
+      const s = seedMap.get(String(n.address).toLowerCase());
+      n.x = s ? s.x : width * 0.39;
+      n.y = s ? s.y : height * 0.5;
+    });
 
-    // One-time settle with center force proportional to radius (big → center)
-    const cx = width * 0.40, cy = height * 0.50;
-    const maxR = Math.max(...holders.map(n => n.r||0), 1);
-    const norm = d => Math.max(0, Math.min(1, (d.r||1)/maxR));
-    const centerStrength = d => 0.05 + 0.25 * Math.pow(norm(d), 1.25);
+    // settle to center without overlaps (big pull stronger)
+    const cx = width * 0.40, cy = height * 0.5;
+    const maxR = Math.max(...holders.map(n => n.r||1), 1);
+    const sizeNorm = (node) => Math.max(0, Math.min(1, (node.r||1)/maxR));
+    const centerStrength = (node) => 0.03 + 0.22 * Math.pow(sizeNorm(node), 1.25);
 
     const sim = d3.forceSimulation(holders)
       .alpha(1)
       .velocityDecay(0.25)
-      .force('collide', d3.forceCollide(d => (d.r||8) + 4).strength(1)) // +4px gap
-      .force('x', d3.forceX(cx).strength(d => centerStrength(d)))
-      .force('y', d3.forceY(cy).strength(d => centerStrength(d)))
+      .force('collide', d3.forceCollide(node => (node.r||8) + 3).strength(1))
+      .force('x', d3.forceX(cx).strength(node => centerStrength(node)))
+      .force('y', d3.forceY(cy).strength(node => centerStrength(node)))
       .stop();
-    for (let i=0;i<180;i++) sim.tick();
+    for (let i=0;i<160;i++) sim.tick();
 
-    // Place LP bubbles in a right column
+    // lay out LPs as a right-side column
     const HBOX = {
       x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
       x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r)
@@ -631,67 +650,83 @@
     const lpGap = 22;
     const lpAreaX = HBOX.x2 + lpGap + (width*0.05);
     let lpY = HBOX.y + 20;
-    lps.forEach(n => { n.x = lpAreaX + n.r; n.y = lpY + n.r; lpY += n.r*2 + 22; });
+    lps.forEach(node => { node.x = lpAreaX + node.r; node.y = lpY + node.r; lpY += node.r*2 + 22; });
 
-    // Draw nodes
+    // zoom
+    const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
+    svg.call(zoom);
+
+    // draw: holders + LPs
     const ALL = holders.concat(lps);
-    const nodeSel = rootG.selectAll('g.node').data(ALL, d => d.address).join(enter => {
+    const nodeSel = rootG.selectAll('g.node').data(ALL, node => node.address).join(enter => {
       const g = enter.append('g').attr('class','node')
-        .attr('transform', d => `translate(${d.x},${d.y})`)
+        .attr('transform', node => `translate(${node.x},${node.y})`)
         .style('cursor','pointer');
 
-      const isCreator = (d.tags||[]).includes('creator');
-      const isLP      = (d.tags||[]).includes('lp');
-      const holderFill = isCreator ? '#f59e0b' : (d.connectId && !d.proxyId ? funderColor(d.connectId) : FILL_HOLDER);
+      // fill: shared-funder filled, creator filled orange, default green; LP purple fill
+      const isLP       = node => (node.tags||[]).includes('lp');
+      const isCreator  = node => (node.tags||[]).includes('creator');
+      const isConn     = node => !!node.connectId;
 
       g.append('circle')
-        .attr('r', d => Math.max(8, d.r || 8))
-        .attr('fill', d => isLP ? FILL_LP : holderFill)
-        .attr('fill-opacity', d => isLP ? 1 : 0.95)
-        .attr('stroke', d => isLP ? STROKE_LP : (d.proxyId ? proxyColor(d.proxyId) : STROKE_DEF))
-        .attr('stroke-width', d => isLP ? 2.6 : (d.proxyId ? 2.6 : 1.2));
+        .attr('r', node => Math.max(8, node.r || 8))
+        .attr('fill', node => isLP(node) ? '#8b5cf6' : (isCreator(node) ? FILL_CREATOR : (isConn(node) ? FILL_CONN : FILL_HOLDER)))
+        .attr('fill-opacity', 0.95)
+        .attr('stroke', node =>
+          isLP(node) ? '#c4b5fd' :
+          (node.proxyId ? proxyColor(String(node.proxyId)) : STROKE_DEF)
+        )
+        .attr('stroke-width', node => isLP(node) ? 2.5 : (node.proxyId ? 3 : 1.2));
 
+      // % label (never exceed bubble)
       g.append('text')
-        .text(d => isLP ? 'LP' : `${(+d.pct || 0).toFixed(2)}%`)
-        .attr('text-anchor','middle').attr('dy','0.32em')
+        .text(node => isLP(node) ? 'LP' : `${(+node.pct || 0).toFixed(2)}%`)
+        .attr('text-anchor','middle')
+        .attr('dy','0.32em')
         .attr('pointer-events','none')
-        .attr('fill','rgba(255,255,255,.90)')
-        .attr('font-size', d => {
-          const maxFs = Math.max(8, (d.r||12) * 0.48);
-          const base  = Math.max(9, Math.min(14, (d.r||14)/3 + 7));
+        .attr('fill','rgba(255,255,255,.88)')
+        .attr('font-size', node => {
+          const maxFs = Math.max(8, (node.r||12) * 0.48);
+          const base  = Math.max(9, Math.min(14, (node.r||14)/3 + 7));
           return Math.min(base, maxFs);
         });
 
       const tip = getTip();
-      g.on('mouseenter', (ev,d)=>{
-        if (d.proxyId){
-          nodeSel.selectAll('circle').attr('opacity', n => (n.proxyId && n.proxyId===d.proxyId) ? 1 : 0.35);
-          nodeSel.selectAll('circle').attr('stroke-width', n => (n.proxyId && n.proxyId===d.proxyId) ? 3.2 : (isLP ? 2.6 : 1.2));
-        } else if (d.connectId && !d.proxyId){
-          nodeSel.selectAll('circle').attr('opacity', n => (n.connectId && n.connectId===d.connectId && !n.proxyId) ? 1 : 0.35);
+      g.on('mouseenter', (ev,node)=>{
+        if (node.proxyId){
+          nodeSel.selectAll('circle')
+            .attr('opacity', other => (other.proxyId && other.proxyId === node.proxyId) ? 1 : 0.35)
+            .attr('stroke-width', other => (other.proxyId && other.proxyId === node.proxyId) ? 3.5 : ( (other.tags||[]).includes('lp') ? 2.5 : 1.2 ));
+        } else if (node.connectId){
+          nodeSel.selectAll('circle')
+            .attr('opacity', other => (other.connectId && other.connectId === node.connectId) ? 1 : 0.35);
         }
-        tip.html(`
-          <div style="font-weight:700;margin-bottom:4px">${isLP ? 'LP' : ((+d.pct||0).toFixed(2)+'% of supply')}</div>
-          <div><b>Address:</b> ${d.address}</div>
-          <div><b>Peak held:</b> ${isFinite(d.peakTokens)? fmtNum(d.peakTokens,6):'—'} tokens</div>
-          <div><b>Left:</b> ${isFinite(d.leftTokens)? fmtNum(d.leftTokens,6):'—'} tokens${isFinite(d.leftPct)? ` (${d.leftPct.toFixed(1)}%)` : ''}</div>
-          ${(d.tags && d.tags.length) ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : ''}
-          ${d.proxyId  ? `<div class="mono" style="opacity:.85">Proxy group</div>` : ''}
-          ${d.connectId? `<div class="mono" style="opacity:.85">Shared funder</div>` : ''}
-          <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
-        `).style('opacity',1);
+        const peak  = Number.isFinite(node.peakTokens) ? node.peakTokens : null;
+        const left  = Number.isFinite(node.leftTokens) ? node.leftTokens : null;
+        const leftP = Number.isFinite(node.leftPct)    ? node.leftPct    : null;
+        tip.html([
+          `<div style="font-weight:700;margin-bottom:4px">${isLP(node) ? 'LP' : ((+node.pct||0).toFixed(2)+'% of supply')}</div>`,
+          `<div><b>Address:</b> ${node.address}</div>`,
+          `<div><b>Peak held:</b> ${peak!=null ? fmtNum(peak,6) : '—'} tokens</div>`,
+          `<div><b>Left:</b> ${left!=null ? fmtNum(left,6) : '—'} tokens${leftP!=null ? ` (${leftP.toFixed(1)}%)` : ''}</div>`,
+          isCreator(node) ? `<div class="mono" style="opacity:.85">Creator</div>` : '',
+          node.proxyId ? `<div class="mono" style="opacity:.85">Proxy group</div>` : '',
+          node.connectId ? `<div class="mono" style="opacity:.85">Shared funder</div>` : '',
+          `<div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>`
+        ].join('')).style('opacity',1);
       }).on('mousemove', (ev)=>{
         getTip().style('left',(ev.clientX+12)+'px').style('top',(ev.clientY+12)+'px');
       }).on('mouseleave', ()=>{
-        nodeSel.selectAll('circle').attr('opacity', 1).attr('stroke-width', d => ((d.tags||[]).includes('lp')) ? 2.6 : (d.proxyId ? 2.6 : 1.2));
+        nodeSel.selectAll('circle').attr('opacity', 1)
+          .attr('stroke-width', other => ( (other.tags||[]).includes('lp') ? 2.5 : (other.proxyId ? 3 : 1.2) ));
         getTip().style('opacity',0);
       });
 
-      g.on('click', (ev,d)=> window.open(`${EX}/address/${d.address}`, '_blank'));
+      g.on('click', (ev,node)=> window.open(`${EX}/address/${node.address}`, '_blank'));
       return g;
     });
 
-    // Zoom + fit-to-view
+    // fit view
     fitToView();
     function fitToView(){
       const bbox = rootG.node().getBBox();
@@ -704,15 +739,14 @@
       svg.call(z).transition().duration(450).call(z.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
     }
 
-    // Legend
-    const legend = svg.append('g').attr('transform', `translate(${width-180},${14})`);
-    legend.append('rect').attr('width',168).attr('height', 60).attr('fill','rgba(0,0,0,.35)').attr('rx',8);
+    // tiny legend
+    const legend = svg.append('g').attr('transform', `translate(${width-172},${14})`);
+    legend.append('rect').attr('width',160).attr('height', 58).attr('fill','rgba(0,0,0,.35)').attr('rx',8);
     legend.append('text').attr('x',10).attr('y',18).attr('fill','#fff').attr('font-size',11).text('Group strokes:');
-    legend.append('line').attr('x1',12).attr('y1',28).attr('x2',44).attr('y2',28)
-      .attr('stroke', proxyIds.length ? proxyColor(proxyIds[0]) : '#f59e0b').attr('stroke-width',3.2);
-    legend.append('text').attr('x',50).attr('y',31).attr('fill','#fff').attr('font-size',11).text('Proxy group');
-    legend.append('rect').attr('x',10).attr('y',36).attr('width',20).attr('height',10).attr('fill', funderIds.length ? funderColor(funderIds[0]) : '#1e293b');
-    legend.append('text').attr('x',50).attr('y',45).attr('fill','#fff').attr('font-size',11).text('Shared funder fill');
+    legend.append('line').attr('x1',12).attr('y1',30).attr('x2',44).attr('y2',30).attr('stroke', proxyIds.length ? proxyColor(proxyIds[0]) : '#f59e0b').attr('stroke-width',3.5);
+    legend.append('text').attr('x',50).attr('y',33).attr('fill','#fff').attr('font-size',11).text('Proxy group');
+    legend.append('rect').attr('x',12).attr('y',38).attr('width',24).attr('height',10).attr('fill', FILL_CONN);
+    legend.append('text').attr('x',50).attr('y',47).attr('fill','#fff').attr('font-size',11).text('Shared funder');
 
     function getTip(){
       let tip = d3.select('#bubble-tip');
@@ -725,15 +759,20 @@
       }
       return tip;
     }
-    function fmtNum(n, d=4){
-      if (!isFinite(n)) return '0';
-      const abs = Math.abs(n);
-      if (abs >= 1e9) return (n/1e9).toFixed(2)+'B';
-      if (abs >= 1e6) return (n/1e6).toFixed(2)+'M';
-      if (abs >= 1e3) return (n/1e3).toFixed(2)+'k';
-      return Number(n).toLocaleString(undefined,{ maximumFractionDigits:d });
+    function fmtNum(n, prec=4){
+      if (!Number.isFinite(n)) return '0';
+      const a = Math.abs(n);
+      if (a >= 1e9) return (n/1e9).toFixed(2)+'B';
+      if (a >= 1e6) return (n/1e6).toFixed(2)+'M';
+      if (a >= 1e3) return (n/1e3).toFixed(2)+'k';
+      return Number(n).toLocaleString(undefined,{ maximumFractionDigits:prec });
     }
+  } catch (err) {
+    console.error(err);
+    rootEl.innerHTML = `<div class="banner mono">Error: ${err?.message || err}</div>`;
   }
+}
+
 
   // ======== Container B ========
   function renderStatusGrid(list25){
@@ -792,45 +831,44 @@
         scored.push({ address:a, eth:ethBal, tokenUsd:port.totalUsd||0, meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0} });
         await sleep(60);
       }
-      scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
-      const top = scored.slice(0, TOP_FUNDER_LIMIT);
-      fundersInner().innerHTML = `
+
+       // ...
+scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
+const top = scored.slice(0, TOP_FUNDER_LIMIT);
+
+const cardsHtml = top.map((r) => {
+  const portal = `https://portal.abs.xyz/profile/${r.address}`;
+  const abscan = `${EXPLORER}/address/${r.address}`;
+  return [
+    '<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">',
+    '  <div>',
+    `    <div class="addr mono" style="font-weight:700">${r.address}</div>`,
+    '    <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">',
+    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>`,
+    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>`,
+    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>`,
+    `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>`,
+    '    </div>',
+    '  </div>',
+    '  <div class="links" style="display:flex;gap:8px;flex-shrink:0">',
+    `    <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>`,
+    `    <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>`,
+    '  </div>',
+    '</div>'
+  ].join('');
+}).join('');
+
+fundersInner().innerHTML = `
   <div class="mono" style="margin-bottom:8px">
     <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
     Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
   </div>
-  ${top.map(r=>{
-const portal = `https://portal.abs.xyz/profile/${r.address}`;
-const abscan = `${EXPLORER}/address/${r.address}`;
-
-    return `
-      <div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
-        <div>
-          <div class="addr mono" style="font-weight:700">\${r.address}</div>
-          <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
-            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">\${fmtNum(r.meta.ethAmount,6)} (\${r.meta.ethCount})</span></span>
-            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">\${fmtNum(r.meta.wethAmount,6)} (\${r.meta.wethCount})</span></span>
-            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">\${fmtNum(r.tokenUsd,2)}</span></span>
-            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">\${fmtNum(r.eth,6)}</span></span>
-          </div>
-        </div>
-        <div class="links" style="display:flex;gap:8px;flex-shrink:0">
-          <button class="btn mono" onclick="window.open('\${portal}','_blank')">Portal</button>
-          <a class="btn mono" href="\${abscan}" target="_blank" rel="noopener">Explorer</a>
-        </div>
-      </div>
-    `;
-  }).join('')}
+  ${cardsHtml}
   <div style="margin-top:10px; display:none">
     <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
   </div>
 `;
-      const btn = document.getElementById('findCommonBtn');
-      if (btn) btn.onclick = () => findCommonFunders(top.map(x=>x.address));
-    }catch(e){
-      fundersInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`;
-    }finally{ setScanStatus('Done. Click a wallet row to view funders.'); }
-  }
+
 
   async function findCommonFunders(addrs){
     showOverlay(commonOverlay());
