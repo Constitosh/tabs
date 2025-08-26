@@ -399,7 +399,7 @@
     }
 
     // Holders for bubble map (exclude pure proxy addresses as holders)
-    const tokenDecimals = chooseDecimals(txs);
+ 
     const holdersForBubblesRaw = holdersAll
       .filter(h => !proxySet.has(String(h.address).toLowerCase()))
       .map(h => {
