@@ -598,9 +598,9 @@ function renderBubbleGraph(rootEl, graph){
   const pack = d3.pack().size([width, height]).padding(3);
   const pRoot = d3.hierarchy({ children: nodes }).sum(d => (d && d.r ? d.r * d.r : 1));
   const leaves = pack(pRoot).leaves();
-  const byAddr = a => String(a||'').toLowerCase();
-  const seed   = new Map(leaves.map(l => [byAddr(l.data.address), l]));
-  nodes.forEach(n => { const s = seed.get(byAddr(n.address)); n.x = s ? s.x : Math.random()*width; n.y = s ? s.y : Math.random()*height; });
+  const addrKey = a => String(a||'').toLowerCase();
+  const seed   = new Map(leaves.map(l => [addrKey(l.data.address), l]));
+  nodes.forEach(n => { const s = seed.get(addrKey(n.address)); n.x = s ? s.x : Math.random()*width; n.y = s ? s.y : Math.random()*height; });
 
   // biggest to center + gentle drift
   const cx = width/2, cy = height/2;
@@ -699,9 +699,8 @@ function renderBubbleGraph(rootEl, graph){
       .attr('x1', d => pos(d.source).x).attr('y1', d => pos(d.source).y)
       .attr('x2', d => pos(d.target).x).attr('y2', d => pos(d.target).y);
   }
-  const map = new Map(nodes.map(n => [byAddr(n.address), n]));
-  function pos(a){ const n = map.get(byAddr(a)); return n || { x: cx, y: cy }; }
-  function byAddr(a){ return String(a||'').toLowerCase(); }
+  const map = new Map(nodes.map(n => [addrKey(n.address), n]));
+  function pos(a){ const n = map.get(addrKey(a)); return n || { x: cx, y: cy }; }
 
   function getTip(){
     let tip = d3.select('#bubble-tip');
@@ -724,6 +723,7 @@ function renderBubbleGraph(rootEl, graph){
     return Number(n).toLocaleString(undefined, { maximumFractionDigits: 4 });
   }
 }
+
 
 
    
