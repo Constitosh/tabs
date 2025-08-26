@@ -342,7 +342,8 @@
 const currentSupplyUnits = mintedUnits >= burnedUnits ? (mintedUnits - burnedUnits) : 0n;
 // This denominator is used for all % calcs (holders + LP), so they always
 // sum to ~100% and never exceed it.
-const denomUnits = currentSupplyUnits;
+const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0n);
+
 
 
      
@@ -417,7 +418,7 @@ const denomUnits = currentSupplyUnits;
         const pct = denomUnits>0n ? pctUnits(h.units, denomUnits) : 0;
         return { address:h.address, units:h.units, balance:Number(h.units)/(10**tokenDecimals), pct };
       })
-      .filter(h => (h.pct||0) >= 0.001)
+      .filter(h => (h.pct||0) >= 0.01)
       .slice(0, 500);
 
     // LP nodes from Dexscreener 'liquidity.base' (fallback: on-chain)
@@ -625,10 +626,26 @@ function renderBubbleGraph(rootEl, graph){
     lps.forEach(n => n.r = rScale(n.pct));
 
     // seeds from a pack (bigger tend to center)
-    const pack = d3.pack().size([width * 0.78, height * 0.9]).padding(7);
-    const pRoot = d3.hierarchy({ children: holders }).sum(node => {
-      const rr = (node && node.r) ? node.r : 1; return rr * rr;
+const pack = d3.pack().size([width, height]).padding(3);
+const root = d3.hierarchy({ children: holders }).sum(d => d.balance);
+const nodes = pack(root).leaves();
+     holders.forEach(h=>{
+  const n = nodes.find(x => x.data.address === h.address);
+  if (n){ h.x = n.x; h.y = n.y; h.r = n.r; }
+
     });
+
+     for (const pa of pairAddresses){
+  const base = lpAlloc.perPair.get(pa) || 0;
+  const pct = denomUnits>0n ? (base/ (Number(denomUnits)/(10**tokenDecimals))) * 100 : 0;
+  if (pct>0){
+    holders.push({
+      address: pa, pct, balance: base,
+      tags:['lp'], label:'LP'
+    });
+  }
+}
+
     const seedMap = new Map(pack(pRoot).leaves().map(l => [String(l.data.address).toLowerCase(), {x:l.x, y:l.y}]));
     holders.forEach(n => {
       const s = seedMap.get(String(n.address).toLowerCase());
