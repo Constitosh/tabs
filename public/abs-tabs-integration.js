@@ -755,33 +755,37 @@
       }
       scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
       const top = scored.slice(0, TOP_FUNDER_LIMIT);
-      fundersInner().innerHTML = `
-        <div class="mono" style="margin-bottom:8px">
-          <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
-          Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
+    fundersInner().innerHTML = `
+  <div class="mono" style="margin-bottom:8px">
+    <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
+    Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
+  </div>
+  ${top.map(r=>{
+    const portal = `https://portal.abs.xyz/profile/${r.address}`;
+    const abscan = `${EXPLORER}/address/${r.address}`;
+    return `
+      <div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
+        <div>
+          <div class="addr mono" style="font-weight:700">${r.address}</div>
+          <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
+            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>
+            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>
+            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>
+            <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>
+          </div>
         </div>
-        ${top.map(r=>{
-          const portal=\`https://portal.abs.xyz/profile/\${r.address}\`; const abscan=\`${EXPLORER}/address/\${r.address}\`;
-          return \`<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
-            <div>
-              <div class="addr mono" style="font-weight:700">\${r.address}</div>
-              <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">\${fmtNum(r.meta.ethAmount,6)} (\${r.meta.ethCount})</span></span>
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">\${fmtNum(r.meta.wethAmount,6)} (\${r.meta.wethCount})</span></span>
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">\${fmtNum(r.tokenUsd,2)}</span></span>
-                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">\${fmtNum(r.eth,6)}</span></span>
-              </div>
-            </div>
-            <div class="links" style="display:flex;gap:8px;flex-shrink:0">
-              <button class="btn mono" onclick="window.open('\${portal}','_blank')">Portal</button>
-              <a class="btn mono" href="\${abscan}" target="_blank" rel="noopener">Explorer</a>
-            </div>
-          </div>\`;
-        }).join('')}
-        <div style="margin-top:10px; display:none">
-          <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
+        <div class="links" style="display:flex;gap:8px;flex-shrink:0">
+          <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>
+          <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>
         </div>
-      `;
+      </div>
+    `;
+  }).join('')}
+  <div style="margin-top:10px; display:none">
+    <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
+  </div>
+`;
+
       const btn = document.getElementById('findCommonBtn');
       if (btn) btn.onclick = () => findCommonFunders(top.map(x=>x.address));
     }catch(e){
