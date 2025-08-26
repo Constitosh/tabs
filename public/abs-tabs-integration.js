@@ -510,6 +510,7 @@
       peakTokens: Number(h.balance || 0),
       leftTokens: Number(h.balance || 0),
       leftPct: 100
+    }
     }));
 
     const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
