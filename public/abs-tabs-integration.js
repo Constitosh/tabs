@@ -1,10 +1,10 @@
-/* abs-tabs-integration.js — unified A+B integration (v4)
+/* abs-tabs-integration.js — unified A+B integration (v5)
    - Cache-first deep scan via /api/token-stats (GET) with timestamp
    - Fresh scan saver via /api/token-stats/save (POST)
-   - Container A: stats + D3 bubble map + snapshot ts
+   - Container A: stats + interactive D3 graph (bubbles+edges) + snapshot ts
    - Container B: First 25 vs Top 25 + status grid + row->funders overlay
    - Funding wallets overlay (ETH + WETH inbound before first receipt)
-   - Hidden "common funders" button (kept in code, not shown)
+   - Proxy/TG bot highlighting and edges (visible without hover)
    - 5-min holders polling for SPECIAL_HOLDERS_CA updates header tile
 */
 (function (global) {
@@ -21,6 +21,12 @@
   const TOP_FUNDER_LIMIT = 5;
   const TOP_COMMON_LIMIT = 5;
   const SPECIAL_HOLDERS_CA = '0x8c3d850313eb9621605cd6a1acb2830962426f67';
+
+  // Known proxy / TG bot routers (extend as needed)
+  const KNOWN_PROXIES = new Set([
+    '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f' // Telegram bot (provided)
+  ]);
+  const FUNDING_WINDOW_SECS = 120 * 60;  // 120 minutes
 
   // ======== DOM ========
   const $ = (s) => document.querySelector(s);
@@ -192,7 +198,7 @@
       if (seen.has(to)) continue;
       out.push({ address:to, timeStamp:Number(l.timeStamp||l.blockTimestamp||0), txHash:l.transactionHash, firstInAmount:0 });
       seen.add(to);
-      if (out.length>=27) break; // we will drop the first two (likely LP/mints)
+      if (out.length>=27) break; // drop the first two (likely LP/mints)
     }
     return out.slice(2);
   }
@@ -215,23 +221,44 @@
   }
 
   // ======== Funding discovery & overlays ========
-  async function getFundingWallets(addr, cutoffTs){
+  // Extended: optional fromTs lower bound to support N-minute window
+  async function getFundingWallets(addr, cutoffTs, fromTs){
     const [nativeTxs, erc20Txs] = await Promise.all([
       apiTxlist(addr).catch(()=>[]),
       apiTokentx({ address:addr }).catch(()=>[])
     ]);
+    const lb = fromTs ? Number(fromTs) : null;
+    const ub = cutoffTs ? Number(cutoffTs) : null;
 
-    const incomingEth = nativeTxs.filter(tx => (tx.to||'').toLowerCase()===addr.toLowerCase() && (!cutoffTs || Number(tx.timeStamp)<=Number(cutoffTs)));
+    const inboundTimeOk = (ts) => {
+      const t = Number(ts||0);
+      if (ub != null && t > ub) return false;
+      if (lb != null && t < lb) return false;
+      return true;
+    };
+
+    const incomingEth = nativeTxs.filter(tx =>
+      (tx.to||'').toLowerCase()===addr.toLowerCase() && inboundTimeOk(tx.timeStamp)
+    );
     const ethMap = new Map();
     for (const tx of incomingEth){
-      const from=(tx.from||'').toLowerCase(); const prev=ethMap.get(from)||{ count:0, amount:0 }; prev.count++; prev.amount += Number(tx.value||0)/1e18; ethMap.set(from,prev);
+      const from=(tx.from||'').toLowerCase();
+      const prev=ethMap.get(from)||{ count:0, amount:0 };
+      prev.count++; prev.amount += Number(tx.value||0)/1e18;
+      ethMap.set(from,prev);
     }
 
-    const incomingWeth = erc20Txs.filter(t => (t.tokenSymbol||'').toUpperCase()==='WETH' && (t.to||'').toLowerCase()===addr.toLowerCase() && (!cutoffTs || Number(t.timeStamp)<=Number(cutoffTs)));
+    const incomingWeth = erc20Txs.filter(t =>
+      (t.tokenSymbol||'').toUpperCase()==='WETH' && (t.to||'').toLowerCase()===addr.toLowerCase() && inboundTimeOk(t.timeStamp)
+    );
     const wethMap = new Map();
     for (const t of incomingWeth){
-      const from=(t.from||'').toLowerCase(); const dec=Number(t.tokenDecimal||18); const amt=unitsToNum(t.value, dec);
-      const prev=wethMap.get(from)||{ count:0, amount:0 }; prev.count++; prev.amount+=amt; wethMap.set(from,prev);
+      const from=(t.from||'').toLowerCase();
+      const dec=Number(t.tokenDecimal||18);
+      const amt=unitsToNum(t.value, dec);
+      const prev=wethMap.get(from)||{ count:0, amount:0 };
+      prev.count++; prev.amount+=amt;
+      wethMap.set(from,prev);
     }
 
     const merged = new Map();
@@ -488,73 +515,219 @@
 
     result.b = { first25: enriched.slice(0,25), top25 };
 
+    // ---- Build graph edges & extra nodes (LPs, funders, proxies) ----
+    const edges = [];
+    const extraNodes = [];
+    const seenExtra = new Set();
+    const ensureExtra = (addr, tags=[])=>{
+      const key = String(addr||'').toLowerCase();
+      if (!key || seenExtra.has(key)) return;
+      extraNodes.push({ address:key, balance:0, pct:0, label:null, tags:[...new Set(tags)] });
+      seenExtra.add(key);
+    };
+
+    // Include LP pair addresses as nodes (ensure present)
+    for (const n of result.a.lpNodes || []){
+      ensureExtra(n.address, ['lp']);
+    }
+
+    // For first25 receivers, find funders within 120 minutes before first receipt
+    const firstList = (result.b.first25 || []).slice(0,25);
+    for (const r of firstList){
+      const buyer = (r.address || '').toLowerCase();
+      const cutoffTs = Number(r.timeStamp || 0);
+      const fromTs = cutoffTs ? (cutoffTs - FUNDING_WINDOW_SECS) : null;
+
+      let addrs = [];
+      try{
+        const resp = await getFundingWallets(buyer, cutoffTs, fromTs);
+        addrs = Array.isArray(resp?.addrs) ? resp.addrs : [];
+      }catch{}
+
+      const uniq = Array.from(new Set(addrs.map(a => String(a||'').toLowerCase())));
+      for (const f of uniq){
+        if (!f) continue;
+        const isProxy = KNOWN_PROXIES.has(f);
+        edges.push({ source:f, target:buyer, type: isProxy ? 'proxy' : 'funding', weight:1 });
+        const tags = ['funder']; if (isProxy) tags.push('proxy');
+        ensureExtra(f, tags);
+        if (isProxy){
+          r._viaProxy = true;
+        }
+      }
+    }
+
+    // Attach graph bits to A so renderer can use them
+    result.a.graphEdges = edges;
+    result.a.graphExtraNodes = extraNodes;
+    result.a.viaProxyAddrs = Array.from(new Set(firstList.filter(x=>x._viaProxy).map(x=>x.address.toLowerCase())));
+
     // done
     return result;
   }
 
+  // ======== Graph renderer (bubbles + edges) ========
+  function renderBubbleGraph(rootEl, graph){
+    const EX = graph.explorer || 'https://abscan.org';
+    const nodes = (graph.nodes || []).slice(0, 500);     // hard cap
+    const edges = graph.edges || [];
 
-function buildGraphFromScan(A, B, metaIn){
-  const holders = (A.holdersForBubbles || []).slice(0,500).map(h => ({
-    address: h.address,
-    balance: Number(h.balance ?? 0),
-    pct: Number(h.pct ?? 0),
-    label: null,
-    tags: [],
-    peak: null, pctLeft: null,
-    fundedBy: [], connections: [], firstBuy: null, viaProxy: null
-  }));
+    rootEl.innerHTML = '';
+    const width  = rootEl.clientWidth || 960;
+    const height = Math.max(560, Math.round(width * 0.48));
 
-  const byAddr = new Map(holders.map(n => [n.address.toLowerCase(), n]));
+    const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+    const rootG = svg.append('g');
+    const linkG = rootG.append('g').attr('class','links');
+    const nodeG = rootG.append('g').attr('class','nodes');
 
-  // Use your panel B data when present to show Peak + % left
-  for (const r of (B.first25 || [])){
-    const n = byAddr.get((r.address||'').toLowerCase());
-    if (!n) continue;
-    const peak = Math.max(Number(r.totalIn||0), Number(r.holdings||0));
-    if (peak > 0){
-      n.peak = peak;
-      n.pctLeft = Math.max(0, Math.min(100, (Number(r.holdings||0) / peak) * 100));
+    const roleColor = (tags=[]) => {
+      const set = new Set(tags.map(t => String(t).toLowerCase()));
+      if (set.has('creator')) return '#ffd166';
+      if (set.has('lp'))      return '#c586ff';
+      if (set.has('burn'))    return '#94a3b8';
+      if (set.has('funder'))  return '#07c160';
+      return 'var(--text)';
+    };
+
+    // radius by % of supply (sqrt)
+    const maxPct = Math.max(0.0001, ...nodes.map(n => +n.pct || 0));
+    const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
+    nodes.forEach(n => { n.r = rScale(+n.pct || 0); if (!n.tags) n.tags = []; });
+
+    // Start: pack for good seeds
+    const pack = d3.pack().size([width, height]).padding(3);
+    const pRoot = d3.hierarchy({ children: nodes }).sum(d => (d && d.r ? d.r * d.r : 1));
+    const leaves = pack(pRoot).leaves();
+    const byAddr = a => String(a||'').toLowerCase();
+    const seed   = new Map(leaves.map(l => [byAddr(l.data.address), l]));
+    nodes.forEach(n => { const s = seed.get(byAddr(n.address)); n.x = s ? s.x : Math.random()*width; n.y = s ? s.y : Math.random()*height; });
+
+    // Biggest towards center + gentle drift
+    const cx = width/2, cy = height/2;
+    const maxR = Math.max(...nodes.map(n => n.r || 0), 1);
+    const nSize = d => Math.max(0, Math.min(1, (d.r || 1)/maxR));
+    const centerStrength = d => 0.06 + 0.18 * ((nSize(d) - 0.3) / 0.7); // 0.06..0.24
+
+    const sim = d3.forceSimulation(nodes)
+      .alpha(0.9)
+      .velocityDecay(0.35) // “space” drift
+      .force('collide', d3.forceCollide(d => Math.max(6, d.r)).strength(0.9))
+      .force('x', d3.forceX(cx).strength(d => centerStrength(d)))
+      .force('y', d3.forceY(cy).strength(d => centerStrength(d)))
+      .on('tick', ticked);
+
+    nodes.forEach(n => { n.vx = (Math.random()-0.5)*0.3; n.vy = (Math.random()-0.5)*0.3; });
+
+    // zoom/pan + stop sim on interaction
+    const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
+    svg.call(zoom);
+    svg.on('mousedown.stop-sim', () => sim.alphaTarget(0).stop());
+
+    // edges
+    const linkSel = linkG.selectAll('line').data(edges, d => `${d.source}|${d.target}|${d.type}`).join('line')
+      .attr('stroke', d => d.type === 'funding' ? '#07c160' : (d.type === 'proxy' ? '#ffd54a' : '#89b6a0'))
+      .attr('stroke-opacity', d => d.type === 'proxy' ? 0.85 : 0.25)
+      .attr('stroke-width', d => Math.max(1, d.weight || 1));
+
+    // nodes
+    const nodeSel = nodeG.selectAll('g.node').data(nodes, d => d.address).join(enter => {
+      const g = enter.append('g').attr('class','node').attr('transform', d => `translate(${d.x},${d.y})`).style('cursor','pointer');
+
+      // main bubble
+      g.append('circle')
+        .attr('r', d => Math.max(8, d.r || 8))
+        .attr('fill', d => roleColor(d.tags))
+        .attr('fill-opacity', 0.95)
+        .attr('stroke', 'rgba(0,0,0,.35)').attr('stroke-width', 1);
+
+      // proxy/bot ring (always visible)
+      g.append('circle')
+        .attr('class','proxy-ring')
+        .attr('r', d => Math.max(8, d.r || 8) + 2)
+        .attr('fill', 'none')
+        .attr('stroke', d => {
+          const tags = (d.tags||[]).map(t => String(t).toLowerCase());
+          return (tags.includes('proxy') || tags.includes('via-proxy')) ? '#ffd54a' : 'none';
+        })
+        .attr('stroke-width', 2);
+
+      // % label (main bubble text)
+      g.append('text')
+        .text(d => `${(+d.pct || 0).toFixed(2)}%`)
+        .attr('text-anchor','middle').attr('dy','0.32em')
+        .attr('font-size', d => Math.max(9, Math.min(12, (d.r||12)/3 + 7)))
+        .attr('pointer-events','none')
+        .attr('fill','rgba(0,0,0,.85)');
+
+      // click → explorer
+      g.on('click', (ev,d)=> window.open(`${EX}/address/${d.address}`, '_blank'));
+
+      // hover info
+      const tip = getTip();
+      g.on('mouseenter', (ev,d)=>{
+        const tags = d.tags && d.tags.length ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : '';
+        const peak = (d.peak!=null) ? `<div><b>Peak held:</b> ${fmtNum(d.peak)} — <b>Left:</b> ${d.pctLeft!=null ? d.pctLeft.toFixed(1)+'%' : '—'}</div>` : '';
+        tip.html(`
+          <div style="font-weight:700;margin-bottom:4px">${(+d.pct||0).toFixed(2)}%</div>
+          <div><b>Address:</b> ${d.address}</div>
+          ${tags}${peak}
+          <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
+        `).style('opacity',1);
+      }).on('mousemove', (ev)=>{
+        const x = ev.clientX+12, y = ev.clientY+12;
+        getTip().style('left', x+'px').style('top', y+'px');
+      }).on('mouseleave', ()=> getTip().style('opacity',0));
+
+      return g;
+    });
+
+    // fit to view
+    fitToView();
+    function fitToView(){
+      const bbox = nodeG.node().getBBox();
+      const pad = 28;
+      const k = Math.min(
+        (width  - pad*2) / Math.max(1, bbox.width),
+        (height - pad*2) / Math.max(1, bbox.height)
+      );
+      const scale = Math.max(0.7, Math.min(3, k));
+      const tx = (width  - scale*(bbox.x + bbox.width/2));
+      const ty = (height - scale*(bbox.y + bbox.height/2));
+      svg.transition().duration(450).call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+    }
+
+    function ticked(){
+      nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+      linkSel
+        .attr('x1', d => pos(d.source).x).attr('y1', d => pos(d.source).y)
+        .attr('x2', d => pos(d.target).x).attr('y2', d => pos(d.target).y);
+    }
+    const map = new Map(nodes.map(n => [byAddr(n.address), n]));
+    function pos(a){ const n = map.get(byAddr(a)); return n || { x: cx, y: cy }; }
+    function byAddr(a){ return String(a||'').toLowerCase(); }
+    function getTip(){
+      let tip = d3.select('#bubble-tip');
+      if (tip.empty()){
+        tip = d3.select('body').append('div').attr('id','bubble-tip')
+          .style('position','fixed').style('background','#111').style('color','#fff')
+          .style('padding','8px 10px').style('border','1px solid '#333'").style('border-radius','8px')
+          .style('pointer-events','none').style('opacity',0).style('z-index',9999)
+          .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
+      }
+      return tip;
+    }
+    function fmtNum(n){
+      if (!isFinite(n)) return '0';
+      const abs = Math.abs(n);
+      if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'k';
+      return Number(n).toLocaleString(undefined, { maximumFractionDigits: 4 });
     }
   }
 
-  // Tag creator + LP bubbles
-  if (metaIn?.creator){
-    const n = byAddr.get(String(metaIn.creator).toLowerCase());
-    if (n){ n.tags.push('creator'); n.label = 'CREATOR'; }
-  }
-  const lpAddresses = (metaIn?.lpAddresses || []);
-  for (const lp of lpAddresses){
-    const key = String(lp).toLowerCase();
-    let n = byAddr.get(key);
-    if (!n){
-      n = { address: key, balance: 0, pct: 0, label: 'LP', tags: ['lp'], peak: null, pctLeft: null, fundedBy: [], connections: [], firstBuy: null, viaProxy: null };
-      holders.push(n); byAddr.set(key, n);
-    } else {
-      if (!n.tags.includes('lp')) n.tags.push('lp');
-      if (!n.label) n.label = 'LP';
-    }
-  }
-
-  return {
-    tokenCA: A.contract || metaIn?.contract || '',
-    supply: String(A.currentSupply || 0),
-    holders,
-    edges: [],
-    meta: {
-      creator: metaIn?.creator || null,
-      lp: lpAddresses[0] || null,
-      burn: '0x0000000000000000000000000000000000000000',
-      explorer: metaIn?.explorer || 'https://abscan.org',
-      knownProxies: [
-        { address: '0x1c4Ae91dfa56e49fcA849edE553759E1f5f04D9F', name: 'TG Proxy', type: 'telegram-bot' }
-      ]
-    }
-  };
-}
-
-
-
-   
+  // ======== Render snapshot ========
   function renderFromData(snapshot){
     // Header note
     if (aSnap()) aSnap().textContent = snapshot.ts ? new Date(snapshot.ts).toLocaleString() : '';
@@ -568,20 +741,55 @@ function buildGraphFromScan(A, B, metaIn){
       <div class="statrow mono"><b>Total Holders (approx)</b><span>${fmtNum(A.totalHolders,0)}</span></div>
       <div class="statrow mono"><b>Top 10 holders</b><span>${(A.top10Pct||0).toFixed(4)}%</span></div>
       <div class="statrow mono"><b>Creator</b><span>${A.creatorAddress ? `<a href="${EXPLORER}/address/${A.creatorAddress}" target="_blank" rel="noopener">${shortAddr(A.creatorAddress)}</a> <span class="muted">(${(A.creatorPct||0).toFixed(4)}%)</span>` : 'n/a'}</span></div>
-    `;// NEW: build a graph object from A(+B) and call the new renderer
-const graph = buildGraphFromScan(A, (snapshot.b || {}), {
-  explorer: EXPLORER,
-  creator: A.creatorAddress || null,
-  lpAddresses: (A.lpNodes || []).map(n => n.address.toLowerCase()),
-});
-initBubbleGraph('#bubble-canvas', graph);
+    `;
 
+    // Build nodes: holders + LP + extra hubs (funders/proxies)
+    const byAddr = new Map();
+    const addNode = (n)=>{ const k=(n.address||'').toLowerCase(); if(!k||byAddr.has(k)) return; byAddr.set(k, n); };
+
+    (A.holdersForBubbles||[]).forEach(h => addNode({ address:h.address, balance:h.balance, pct:h.pct, tags:[], label:null }));
+    (A.lpNodes||[]).forEach(lp => addNode({ address:lp.address, balance:lp.balance, pct:lp.pct, tags:['lp'], label:'LP' }));
+    (A.graphExtraNodes||[]).forEach(x => addNode(x));
+
+    // Peak + % left (from panel B first25)
+    const B = snapshot.b || {};
+    for (const r of (B.first25 || [])){
+      const k = (r.address||'').toLowerCase();
+      const n = byAddr.get(k);
+      if (!n) continue;
+      const peak = Math.max(Number(r.totalIn||0), Number(r.holdings||0));
+      if (peak > 0){
+        n.peak = peak;
+        n.pctLeft = Math.max(0, Math.min(100, (Number(r.holdings||0)/peak) * 100));
+      }
+    }
+
+    // Tag creator
+    if (A.creatorAddress){
+      const n = byAddr.get(A.creatorAddress.toLowerCase());
+      if (n){ n.tags = n.tags || []; if (!n.tags.includes('creator')) n.tags.push('creator'); n.label = n.label || 'CREATOR'; }
+    }
+
+    // Tag buyers that used a proxy (via-proxy)
+    if (Array.isArray(A.viaProxyAddrs)){
+      const via = new Set(A.viaProxyAddrs.map(a=>String(a).toLowerCase()));
+      for (const [k,n] of byAddr.entries()){
+        if (via.has(k)){ n.tags = n.tags||[]; if(!n.tags.includes('via-proxy')) n.tags.push('via-proxy'); }
+      }
+    }
+
+    const graph = {
+      explorer: EXPLORER,
+      nodes: Array.from(byAddr.values()),
+      edges: (A.graphEdges || [])
+    };
+
+    // Render interactive graph
+    renderBubbleGraph(aBubble(), graph);
 
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
-
     // Container B
-    const B = snapshot.b || {};
     const buyers = (B.first25||[]);
     const holders = (B.top25||[]);
     renderStatusGrid(buyers);
