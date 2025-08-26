@@ -800,8 +800,9 @@
     Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
   </div>
   ${top.map(r=>{
-    const portal = \`https://portal.abs.xyz/profile/\${r.address}\`;
-    const abscan = \`${EXPLORER}/address/\${r.address}\`;
+const portal = `https://portal.abs.xyz/profile/${r.address}`;
+const abscan = `${EXPLORER}/address/${r.address}`;
+
     return \`
       <div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
         <div>
