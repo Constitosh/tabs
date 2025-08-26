@@ -1,11 +1,8 @@
-/* abs-tabs-integration.js — unified A+B integration (v6)
-   - Cache-first deep scan via /api/token-stats (GET) with timestamp
-   - Fresh scan saver via /api/token-stats/save (POST)
-   - Container A: stats + D3 bubble map + snapshot ts
-   - Container B: First 25 vs Top 25 + status grid + row->funders overlay
-   - Funding wallets overlay (ETH + WETH inbound before first receipt)
-   - Proxy/shared-funder detection from one tokentx pass (time-window + flow share)
-   - Bubble map: biggest-centered, non-overlapping, % labels; LP shown in right column
+/* abs-tabs-integration.js — unified A+B integration (v7, bubble-map fixes)
+   - Balance-based denominator for all % calcs (holders + LP)
+   - Fixed renderBubbleGraph undefined refs; LPs are laid out from provided nodes only
+   - Biggest-centered, non-overlapping holder bubbles; LP column on the right
+   - First 25 vs Top 25 + status grid; funding overlay (ETH + WETH) preserved
 */
 (function (global) {
   const TABS = {};
@@ -282,7 +279,6 @@
 
   // ======== Fresh scan ========
   async function doFreshScan(contract){
-    const VERIFY_TOP_LIMIT = 0;
     const result = { meta:{ contract }, a:{}, b:{} };
 
     setScanStatus('Downloading token transfer history…');
@@ -316,7 +312,7 @@
       const vBI = toBI(t.value||'0');
       const ts  = Number(t.timeStamp)||0;
 
-      if (from==='0x0000000000000000000000000000000000000000') mintedUnits += vBI;
+      if (from===ZERO) mintedUnits += vBI;
       if (burnSet.has(to)) burnedUnits += vBI;
 
       if (from===contract || to===contract) continue;
@@ -337,19 +333,10 @@
       }
     }
 
-     
-// ===== Supply denominator (units) =====
-const currentSupplyUnits = mintedUnits >= burnedUnits ? (mintedUnits - burnedUnits) : 0n;
-// This denominator is used for all % calcs (holders + LP), so they always
-// sum to ~100% and never exceed it.
-const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0n);
-
-
-
-     
-
-   
-
+    // ===== Supply denominator (units) =====
+    // Use on-chain positive balances for ALL percentage math (holders + LP).
+    const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0n);
+    const currentSupplyUnits = denomUnits; // display and math aligned
 
     // LP addresses & allocation
     setScanStatus('Fetching LP pairs & allocation…');
@@ -412,10 +399,11 @@ const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0
     }
 
     // Holders for bubble map (exclude pure proxy addresses as holders)
+    const tokenDecimals = chooseDecimals(txs);
     const holdersForBubblesRaw = holdersAll
       .filter(h => !proxySet.has(String(h.address).toLowerCase()))
       .map(h => {
-        const pct = denomUnits>0n ? pctUnits(h.units, denomUnits) : 0;
+        const pct = currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0;
         return { address:h.address, units:h.units, balance:Number(h.units)/(10**tokenDecimals), pct };
       })
       .filter(h => (h.pct||0) >= 0.01)
@@ -429,14 +417,19 @@ const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0
         const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
         base = Number(units)/(10**tokenDecimals);
       }
-      const lpPct = (denomUnits>0n) ? ((BigInt(Math.round(base*(10**tokenDecimals))) * 10000n) / denomUnits) / 100n : 0; // % approx
+      // Convert base (token amount) -> percentage of currentSupplyUnits
+      const baseUnitsApprox = BigInt(Math.round(base * (10**tokenDecimals)));
+      const lpPct = currentSupplyUnits>0n ? pctUnits(baseUnitsApprox, currentSupplyUnits) : 0;
       if (lpPct>0) lpNodes.push({ address:pa, balance:base, pct: lpPct, __type:'lp' });
       await sleep(20);
     }
 
     // Stats for header
     const top10Pct  = holdersForBubblesRaw.slice(0,10).reduce((s,h)=>s+(h.pct||0),0);
-    const creatorPct= creatorAddress ? (holdersForBubblesRaw.find(h=>h.address.toLowerCase()===creatorAddress)?.pct || 0) : 0;
+    const creatorPct= (()=>{
+      const c = creatorAddress ? holdersForBubblesRaw.find(h=>h.address.toLowerCase()===creatorAddress) : null;
+      return c ? (c.pct||0) : 0;
+    })();
 
     // Maps for UI tagging
     const proxyMap = {};       // holder -> proxyId
@@ -455,8 +448,8 @@ const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0
       tokenDecimals,
       minted: Number(mintedUnits)/(10**tokenDecimals),
       burned: Number(burnedUnits)/(10**tokenDecimals),
-      currentSupply: Number(denomUnits)/(10**tokenDecimals), // for display
-      currentSupplyUnits: String(denomUnits),                // denominator we used
+      currentSupply: Number(currentSupplyUnits)/(10**tokenDecimals), // display == denominator
+      currentSupplyUnits: String(currentSupplyUnits),
       totalHolders: holdersAll.length,
       top10Pct,
       creatorAddress,
@@ -499,7 +492,7 @@ const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0
           address: h.address,
           firstIn: Number(first.v)/(10**tokenDecimals),
           holdings: Number(h.units)/(10**tokenDecimals),
-          pct: denomUnits>0n ? pctUnits(h.units, denomUnits) : 0
+          pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
         };
       });
 
@@ -508,22 +501,22 @@ const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0
   }
 
   function buildGraphFromScan(A, B){
-const holderNodes = (A.holdersForBubbles || []).map(h => ({
-  address: h.address,
-  balance: Number(h.balance || 0),
-  pct: Number(h.pct || 0),
-  tags: [],
-  label: null,
-  proxyId: null,       // via proxy groups (stroke color)
-  connectId: null,     // shared funder groups (fill color)
-  peakTokens: Number(h.balance || 0),
-  leftTokens: Number(h.balance || 0),
-  leftPct: 100
-}));
+    const holderNodes = (A.holdersForBubbles || []).map(h => ({
+      address: h.address,
+      balance: Number(h.balance || 0),
+      pct: Number(h.pct || 0),
+      tags: [],
+      label: null,
+      proxyId: null,       // via proxy groups (stroke color)
+      connectId: null,     // shared funder groups (fill color)
+      peakTokens: Number(h.balance || 0),
+      leftTokens: Number(h.balance || 0),
+      leftPct: 100
+    }));
 
     const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
 
-    // LP nodes (kept separate visually)
+    // LP nodes (already computed in A.lpNodes)
     for (const lp of (A.lpNodes || [])){
       const key = String(lp.address||'').toLowerCase();
       if (!byAddr.has(key)){
@@ -574,231 +567,210 @@ const holderNodes = (A.holdersForBubbles || []).map(h => ({
     return { explorer: EXPLORER, nodes: Array.from(byAddr.values()) };
   }
 
-function renderBubbleGraph(rootEl, graph){
-  try {
-    const EX = graph.explorer || 'https://abscan.org';
-    const allNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
-    // holders only in main ball
-    const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
-    const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp'));
+  function renderBubbleGraph(rootEl, graph){
+    try {
+      const EX = graph.explorer || 'https://abscan.org';
+      const allNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+      const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
+      const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp'));
 
-    // normalize numbers (protect against NaN)
-    holders.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
-    lps.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
+      // normalize numbers
+      holders.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
+      lps.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
 
-    // cap/normalize tiny rounding so total never exceeds 100%
-    const pctSum = holders.reduce((s,n)=>s+n.pct,0);
-    if (pctSum > 100.0001) {
-      const k = 100 / pctSum;
-      holders.forEach(n => n.pct *= k);
-    }
+      // cap tiny rounding so holder % total ≤ 100
+      const pctSum = holders.reduce((s,n)=>s+n.pct,0);
+      if (pctSum > 100.0001) {
+        const k = 100 / pctSum;
+        holders.forEach(n => n.pct *= k);
+      }
 
-    rootEl.innerHTML = '';
-    const width  = rootEl.clientWidth || 960;
-    const height = Math.max(560, Math.round(width * 0.56));
+      rootEl.innerHTML = '';
+      const width  = rootEl.clientWidth || 960;
+      const height = Math.max(560, Math.round(width * 0.56));
 
-    const svg   = d3.select(rootEl).append('svg')
-      .attr('width', width)
-      .attr('height', height)
-      .style('cursor','grab');
-    const rootG = svg.append('g');
+      const svg   = d3.select(rootEl).append('svg')
+        .attr('width', width)
+        .attr('height', height)
+        .style('cursor','grab');
+      const rootG = svg.append('g');
 
-    // colors
-    const FILL_HOLDER = '#375a4e';
-    const FILL_CONN   = '#0ea5a8';   // filled for shared funder group
-    const FILL_CREATOR= '#f59e0b';   // creator bubble fill (orange)
-    const STROKE_DEF  = 'rgba(0,0,0,.35)';
+      // colors
+      const FILL_HOLDER = '#375a4e';
+      const FILL_CONN   = '#0ea5a8';   // shared funder group
+      const FILL_CREATOR= '#f59e0b';   // creator bubble
+      const STROKE_DEF  = 'rgba(0,0,0,.35)';
 
-    // per-proxy stroke palette
-    const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>String(n.proxyId))));
-    const proxyColor = d3.scaleOrdinal()
-      .domain(proxyIds)
-      .range([
-        '#f59e0b','#60a5fa','#ef4444','#10b981','#a78bfa',
-        '#f472b6','#22d3ee','#f43f5e','#34d399','#eab308',
-        '#38bdf8','#fb7185','#84cc16','#c084fc'
-      ]);
+      // per-proxy stroke palette
+      const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>String(n.proxyId))));
+      const proxyColor = d3.scaleOrdinal()
+        .domain(proxyIds)
+        .range([
+          '#f59e0b','#60a5fa','#ef4444','#10b981','#a78bfa',
+          '#f472b6','#22d3ee','#f43f5e','#34d399','#eab308',
+          '#38bdf8','#fb7185','#84cc16','#c084fc'
+        ]);
 
-    // radius scale
-    const maxPct = Math.max(0.0001, ...holders.map(n => n.pct), ...lps.map(n => n.pct));
-    const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
-    holders.forEach(n => n.r = rScale(n.pct));
-    lps.forEach(n => n.r = rScale(n.pct));
+      // radius scale
+      const maxPct = Math.max(0.0001, ...holders.map(n => n.pct), ...lps.map(n => n.pct));
+      const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
+      holders.forEach(n => n.r = rScale(n.pct));
+      lps.forEach(n => n.r = rScale(n.pct));
 
-    // seeds from a pack (bigger tend to center)
-const pack = d3.pack().size([width, height]).padding(3);
-const root = d3.hierarchy({ children: holders }).sum(d => d.balance);
-const nodes = pack(root).leaves();
-     holders.forEach(h=>{
-  const n = nodes.find(x => x.data.address === h.address);
-  if (n){ h.x = n.x; h.y = n.y; h.r = n.r; }
-
-    });
-
-     for (const pa of pairAddresses){
-  const base = lpAlloc.perPair.get(pa) || 0;
-  const pct = denomUnits>0n ? (base/ (Number(denomUnits)/(10**tokenDecimals))) * 100 : 0;
-  if (pct>0){
-    holders.push({
-      address: pa, pct, balance: base,
-      tags:['lp'], label:'LP'
-    });
-  }
-}
-
-    const seedMap = new Map(pack(pRoot).leaves().map(l => [String(l.data.address).toLowerCase(), {x:l.x, y:l.y}]));
-    holders.forEach(n => {
-      const s = seedMap.get(String(n.address).toLowerCase());
-      n.x = s ? s.x : width * 0.39;
-      n.y = s ? s.y : height * 0.5;
-    });
-
-    // settle to center without overlaps (big pull stronger)
-    const cx = width * 0.40, cy = height * 0.5;
-    const maxR = Math.max(...holders.map(n => n.r||1), 1);
-    const sizeNorm = (node) => Math.max(0, Math.min(1, (node.r||1)/maxR));
-    const centerStrength = (node) => 0.03 + 0.22 * Math.pow(sizeNorm(node), 1.25);
-
-    const sim = d3.forceSimulation(holders)
-      .alpha(1)
-      .velocityDecay(0.25)
-      .force('collide', d3.forceCollide(node => (node.r||8) + 3).strength(1))
-      .force('x', d3.forceX(cx).strength(node => centerStrength(node)))
-      .force('y', d3.forceY(cy).strength(node => centerStrength(node)))
-      .stop();
-    for (let i=0;i<160;i++) sim.tick();
-
-    // lay out LPs as a right-side column
-    const HBOX = {
-      x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
-      x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r)
-    };
-    const lpGap = 22;
-    const lpAreaX = HBOX.x2 + lpGap + (width*0.05);
-    let lpY = HBOX.y + 20;
-    lps.forEach(node => { node.x = lpAreaX + node.r; node.y = lpY + node.r; lpY += node.r*2 + 22; });
-
-    // zoom
-    const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
-    svg.call(zoom);
-
-    // draw: holders + LPs
-    const ALL = holders.concat(lps);
-    const nodeSel = rootG.selectAll('g.node').data(ALL, node => node.address).join(enter => {
-      const g = enter.append('g').attr('class','node')
-        .attr('transform', node => `translate(${node.x},${node.y})`)
-        .style('cursor','pointer');
-
-      // fill: shared-funder filled, creator filled orange, default green; LP purple fill
-      const isLP       = node => (node.tags||[]).includes('lp');
-      const isCreator  = node => (node.tags||[]).includes('creator');
-      const isConn     = node => !!node.connectId;
-
-      g.append('circle')
-        .attr('r', node => Math.max(8, node.r || 8))
-        .attr('fill', node => isLP(node) ? '#8b5cf6' : (isCreator(node) ? FILL_CREATOR : (isConn(node) ? FILL_CONN : FILL_HOLDER)))
-        .attr('fill-opacity', 0.95)
-        .attr('stroke', node =>
-          isLP(node) ? '#c4b5fd' :
-          (node.proxyId ? proxyColor(String(node.proxyId)) : STROKE_DEF)
-        )
-        .attr('stroke-width', node => isLP(node) ? 2.5 : (node.proxyId ? 3 : 1.2));
-
-      // % label (never exceed bubble)
-      g.append('text')
-        .text(node => isLP(node) ? 'LP' : `${(+node.pct || 0).toFixed(2)}%`)
-        .attr('text-anchor','middle')
-        .attr('dy','0.32em')
-        .attr('pointer-events','none')
-        .attr('fill','rgba(255,255,255,.88)')
-        .attr('font-size', node => {
-          const maxFs = Math.max(8, (node.r||12) * 0.48);
-          const base  = Math.max(9, Math.min(14, (node.r||14)/3 + 7));
-          return Math.min(base, maxFs);
-        });
-
-      const tip = getTip();
-      g.on('mouseenter', (ev,node)=>{
-        if (node.proxyId){
-          nodeSel.selectAll('circle')
-            .attr('opacity', other => (other.proxyId && other.proxyId === node.proxyId) ? 1 : 0.35)
-            .attr('stroke-width', other => (other.proxyId && other.proxyId === node.proxyId) ? 3.5 : ( (other.tags||[]).includes('lp') ? 2.5 : 1.2 ));
-        } else if (node.connectId){
-          nodeSel.selectAll('circle')
-            .attr('opacity', other => (other.connectId && other.connectId === node.connectId) ? 1 : 0.35);
-        }
-        const peak  = Number.isFinite(node.peakTokens) ? node.peakTokens : null;
-        const left  = Number.isFinite(node.leftTokens) ? node.leftTokens : null;
-        const leftP = Number.isFinite(node.leftPct)    ? node.leftPct    : null;
-        tip.html([
-          `<div style="font-weight:700;margin-bottom:4px">${isLP(node) ? 'LP' : ((+node.pct||0).toFixed(2)+'% of supply')}</div>`,
-          `<div><b>Address:</b> ${node.address}</div>`,
-          `<div><b>Peak held:</b> ${peak!=null ? fmtNum(peak,6) : '—'} tokens</div>`,
-          `<div><b>Left:</b> ${left!=null ? fmtNum(left,6) : '—'} tokens${leftP!=null ? ` (${leftP.toFixed(1)}%)` : ''}</div>`,
-          isCreator(node) ? `<div class="mono" style="opacity:.85">Creator</div>` : '',
-          node.proxyId ? `<div class="mono" style="opacity:.85">Proxy group</div>` : '',
-          node.connectId ? `<div class="mono" style="opacity:.85">Shared funder</div>` : '',
-          `<div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>`
-        ].join('')).style('opacity',1);
-      }).on('mousemove', (ev)=>{
-        getTip().style('left',(ev.clientX+12)+'px').style('top',(ev.clientY+12)+'px');
-      }).on('mouseleave', ()=>{
-        nodeSel.selectAll('circle').attr('opacity', 1)
-          .attr('stroke-width', other => ( (other.tags||[]).includes('lp') ? 2.5 : (other.proxyId ? 3 : 1.2) ));
-        getTip().style('opacity',0);
+      // use pack to seed positions (bigger center)
+      const pack = d3.pack().size([width, height]).padding(3);
+      const root = d3.hierarchy({ children: holders }).sum(d => d.balance);
+      const seedLeaves = pack(root).leaves();
+      holders.forEach(h=>{
+        const n = seedLeaves.find(x => x.data.address === h.address);
+        if (n){ h.x = n.x; h.y = n.y; h.r = n.r; }
       });
 
-      g.on('click', (ev,node)=> window.open(`${EX}/address/${node.address}`, '_blank'));
-      return g;
-    });
+      // settle to center without overlaps
+      const cx = width * 0.40, cy = height * 0.5;
+      const maxR = Math.max(...holders.map(n => n.r||1), 1);
+      const sizeNorm = (node) => Math.max(0, Math.min(1, (node.r||1)/maxR));
+      const centerStrength = (node) => 0.03 + 0.22 * Math.pow(sizeNorm(node), 1.25);
 
-    // fit view
-    fitToView();
-    function fitToView(){
-      const bbox = rootG.node().getBBox();
-      const pad = 24;
-      const k = Math.min((width-pad*2)/Math.max(1,bbox.width),(height-pad*2)/Math.max(1,bbox.height));
-      const scale = Math.max(0.7, Math.min(3, k));
-      const tx = (width  - scale*(bbox.x + bbox.width/2));
-      const ty = (height - scale*(bbox.y + bbox.height/2));
-      const z = d3.zoom().scaleExtent([0.6,7]).on('zoom', (ev)=> rootG.attr('transform', ev.transform));
-      svg.call(z).transition().duration(450).call(z.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-    }
+      const sim = d3.forceSimulation(holders)
+        .alpha(1)
+        .velocityDecay(0.25)
+        .force('collide', d3.forceCollide(node => (node.r||8) + 3).strength(1))
+        .force('x', d3.forceX(cx).strength(node => centerStrength(node)))
+        .force('y', d3.forceY(cy).strength(node => centerStrength(node)))
+        .stop();
+      for (let i=0;i<160;i++) sim.tick();
 
-    // tiny legend
-    const legend = svg.append('g').attr('transform', `translate(${width-172},${14})`);
-    legend.append('rect').attr('width',160).attr('height', 58).attr('fill','rgba(0,0,0,.35)').attr('rx',8);
-    legend.append('text').attr('x',10).attr('y',18).attr('fill','#fff').attr('font-size',11).text('Group strokes:');
-    legend.append('line').attr('x1',12).attr('y1',30).attr('x2',44).attr('y2',30).attr('stroke', proxyIds.length ? proxyColor(proxyIds[0]) : '#f59e0b').attr('stroke-width',3.5);
-    legend.append('text').attr('x',50).attr('y',33).attr('fill','#fff').attr('font-size',11).text('Proxy group');
-    legend.append('rect').attr('x',12).attr('y',38).attr('width',24).attr('height',10).attr('fill', FILL_CONN);
-    legend.append('text').attr('x',50).attr('y',47).attr('fill','#fff').attr('font-size',11).text('Shared funder');
+      // lay out LPs as a right-side column
+      const HBOX = {
+        x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
+        x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r)
+      };
+      const lpGap = 22;
+      const lpAreaX = HBOX.x2 + lpGap + (width*0.05);
+      let lpY = HBOX.y + 20;
+      lps.forEach(node => { node.x = lpAreaX + node.r; node.y = lpY + node.r; lpY += node.r*2 + 22; });
 
-    function getTip(){
-      let tip = d3.select('#bubble-tip');
-      if (tip.empty()){
-        tip = d3.select('body').append('div').attr('id','bubble-tip')
-          .style('position','fixed').style('background','#111').style('color','#fff')
-          .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
-          .style('pointer-events','none').style('opacity',0).style('z-index',9999)
-          .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
+      // zoom
+      const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
+      svg.call(zoom);
+
+      // draw: holders + LPs
+      const ALL = holders.concat(lps);
+      const nodeSel = rootG.selectAll('g.node').data(ALL, node => node.address).join(enter => {
+        const g = enter.append('g').attr('class','node')
+          .attr('transform', node => `translate(${node.x},${node.y})`)
+          .style('cursor','pointer');
+
+        // helpers
+        const isLP       = node => (node.tags||[]).includes('lp');
+        const isCreator  = node => (node.tags||[]).includes('creator');
+        const isConn     = node => !!node.connectId;
+
+        g.append('circle')
+          .attr('r', node => Math.max(8, node.r || 8))
+          .attr('fill', node => isLP(node) ? '#8b5cf6' : (isCreator(node) ? FILL_CREATOR : (isConn(node) ? FILL_CONN : FILL_HOLDER)))
+          .attr('fill-opacity', 0.95)
+          .attr('stroke', node =>
+            isLP(node) ? '#c4b5fd' :
+            (node.proxyId ? proxyColor(String(node.proxyId)) : STROKE_DEF)
+          )
+          .attr('stroke-width', node => isLP(node) ? 2.5 : (node.proxyId ? 3 : 1.2));
+
+        // % label
+        g.append('text')
+          .text(node => isLP(node) ? 'LP' : `${(+node.pct || 0).toFixed(2)}%`)
+          .attr('text-anchor','middle')
+          .attr('dy','0.32em')
+          .attr('pointer-events','none')
+          .attr('fill','rgba(255,255,255,.88)')
+          .attr('font-size', node => {
+            const maxFs = Math.max(8, (node.r||12) * 0.48);
+            const base  = Math.max(9, Math.min(14, (node.r||14)/3 + 7));
+            return Math.min(base, maxFs);
+          });
+
+        const tip = getTip();
+        g.on('mouseenter', (ev,node)=>{
+          if (node.proxyId){
+            nodeSel.selectAll('circle')
+              .attr('opacity', other => (other.proxyId && other.proxyId === node.proxyId) ? 1 : 0.35)
+              .attr('stroke-width', other => (other.proxyId && other.proxyId === node.proxyId) ? 3.5 : ( (other.tags||[]).includes('lp') ? 2.5 : 1.2 ));
+          } else if (node.connectId){
+            nodeSel.selectAll('circle')
+              .attr('opacity', other => (other.connectId && other.connectId === node.connectId) ? 1 : 0.35);
+          }
+          const peak  = Number.isFinite(node.peakTokens) ? node.peakTokens : null;
+          const left  = Number.isFinite(node.leftTokens) ? node.leftTokens : null;
+          const leftP = Number.isFinite(node.leftPct)    ? node.leftPct    : null;
+          tip.html([
+            `<div style="font-weight:700;margin-bottom:4px">${isLP(node) ? 'LP' : ((+node.pct||0).toFixed(2)+'% of supply')}</div>`,
+            `<div><b>Address:</b> ${node.address}</div>`,
+            `<div><b>Peak held:</b> ${peak!=null ? fmtNum(peak,6) : '—'} tokens</div>`,
+            `<div><b>Left:</b> ${left!=null ? fmtNum(left,6) : '—'} tokens${leftP!=null ? ` (${leftP.toFixed(1)}%)` : ''}</div>`,
+            isCreator(node) ? `<div class="mono" style="opacity:.85">Creator</div>` : '',
+            node.proxyId ? `<div class="mono" style="opacity:.85">Proxy group</div>` : '',
+            node.connectId ? `<div class="mono" style="opacity:.85">Shared funder</div>` : '',
+            `<div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>`
+          ].join('')).style('opacity',1);
+        }).on('mousemove', (ev)=>{
+          getTip().style('left',(ev.clientX+12)+'px').style('top',(ev.clientY+12)+'px');
+        }).on('mouseleave', ()=>{
+          nodeSel.selectAll('circle').attr('opacity', 1)
+            .attr('stroke-width', other => ( (other.tags||[]).includes('lp') ? 2.5 : (other.proxyId ? 3 : 1.2) ));
+          getTip().style('opacity',0);
+        });
+
+        g.on('click', (ev,node)=> window.open(`${EX}/address/${node.address}`, '_blank'));
+        return g;
+      });
+
+      // fit view
+      fitToView();
+      function fitToView(){
+        const bbox = rootG.node().getBBox();
+        const pad = 24;
+        const k = Math.min((width-pad*2)/Math.max(1,bbox.width),(height-pad*2)/Math.max(1,bbox.height));
+        const scale = Math.max(0.7, Math.min(3, k));
+        const tx = (width  - scale*(bbox.x + bbox.width/2));
+        const ty = (height - scale*(bbox.y + bbox.height/2));
+        const z = d3.zoom().scaleExtent([0.6,7]).on('zoom', (ev)=> rootG.attr('transform', ev.transform));
+        svg.call(z).transition().duration(450).call(z.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
       }
-      return tip;
-    }
-    function fmtNum(n, prec=4){
-      if (!Number.isFinite(n)) return '0';
-      const a = Math.abs(n);
-      if (a >= 1e9) return (n/1e9).toFixed(2)+'B';
-      if (a >= 1e6) return (n/1e6).toFixed(2)+'M';
-      if (a >= 1e3) return (n/1e3).toFixed(2)+'k';
-      return Number(n).toLocaleString(undefined,{ maximumFractionDigits:prec });
-    }
-  } catch (err) {
-    console.error(err);
-    rootEl.innerHTML = `<div class="banner mono">Error: ${err?.message || err}</div>`;
-  }
-}
 
+      // tiny legend
+      const legend = svg.append('g').attr('transform', `translate(${width-172},${14})`);
+      legend.append('rect').attr('width',160).attr('height', 58).attr('fill','rgba(0,0,0,.35)').attr('rx',8);
+      legend.append('text').attr('x',10).attr('y',18).attr('fill','#fff').attr('font-size',11).text('Group strokes:');
+      legend.append('line').attr('x1',12).attr('y1',30).attr('x2',44).attr('y2',30).attr('stroke', proxyIds.length ? proxyColor(proxyIds[0]) : '#f59e0b').attr('stroke-width',3.5);
+      legend.append('text').attr('x',50).attr('y',33).attr('fill','#fff').attr('font-size',11).text('Proxy group');
+      legend.append('rect').attr('x',12).attr('y',38).attr('width',24).attr('height',10).attr('fill', FILL_CONN);
+      legend.append('text').attr('x',50).attr('y',47).attr('fill','#fff').attr('font-size',11).text('Shared funder');
+
+      function getTip(){
+        let tip = d3.select('#bubble-tip');
+        if (tip.empty()){
+          tip = d3.select('body').append('div').attr('id','bubble-tip')
+            .style('position','fixed').style('background','#111').style('color','#fff')
+            .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
+            .style('pointer-events','none').style('opacity',0).style('z-index',9999)
+            .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
+        }
+        return tip;
+      }
+      function fmtNum(n, prec=4){
+        if (!Number.isFinite(n)) return '0';
+        const a = Math.abs(n);
+        if (a >= 1e9) return (n/1e9).toFixed(2)+'B';
+        if (a >= 1e6) return (n/1e6).toFixed(2)+'M';
+        if (a >= 1e3) return (n/1e3).toFixed(2)+'k';
+        return Number(n).toLocaleString(undefined,{ maximumFractionDigits:prec });
+      }
+    } catch (err) {
+      console.error(err);
+      rootEl.innerHTML = `<div class="banner mono">Error: ${err?.message || err}</div>`;
+    }
+  }
 
   // ======== Container B ========
   function renderStatusGrid(list25){
@@ -840,86 +812,84 @@ const nodes = pack(root).leaves();
     wire(buyersTop5()); wire(buyersRest());
   }
 
-async function openFundersForRow(tr){
-  const addr = tr.getAttribute('data-addr'); 
-  const ts = Number(tr.getAttribute('data-ts')||0);
-  if (!addr) return;
+  async function openFundersForRow(tr){
+    const addr = tr.getAttribute('data-addr'); 
+    const ts = Number(tr.getAttribute('data-ts')||0);
+    if (!addr) return;
 
-  showOverlay(fundersOverlay());
-  fundersInner().innerHTML = `<div class="banner mono"><span class="spinner"></span> Finding funding wallets (ETH + WETH)…</div>`;
-  setScanStatus('Finding funding wallets (ETH + WETH)…');
+    showOverlay(fundersOverlay());
+    fundersInner().innerHTML = `<div class="banner mono"><span class="spinner"></span> Finding funding wallets (ETH + WETH)…</div>`;
+    setScanStatus('Finding funding wallets (ETH + WETH)…');
 
-  try{
-    const { addrs, info } = await getFundingWallets(addr, ts);
-    if (!addrs.length){
-      fundersInner().innerHTML = `<div class="banner mono">No inbound ETH/WETH before first token receipt.</div>`;
-      return;
+    try{
+      const { addrs, info } = await getFundingWallets(addr, ts);
+      if (!addrs.length){
+        fundersInner().innerHTML = `<div class="banner mono">No inbound ETH/WETH before first token receipt.</div>`;
+        return;
+      }
+
+      const uniq = Array.from(new Set(addrs));
+      const scored=[];
+      for (const a of uniq){
+        const [ethBal, port] = await Promise.all([
+          apiBalance(a).catch(()=>0),
+          tokenPortfolioUsd(a).catch(()=>({ totalUsd:0 }))
+        ]);
+        if ((port.totalUsd||0) > IGNORE_FUNDER_OVER_USD) continue;
+        scored.push({
+          address:a,
+          eth:ethBal,
+          tokenUsd:port.totalUsd||0,
+          meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0}
+        });
+        await sleep(60);
+      }
+
+      scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
+      const top = scored.slice(0, TOP_FUNDER_LIMIT);
+
+      const cardsHtml = top.map((r) => {
+        const portal = `https://portal.abs.xyz/profile/${r.address}`;
+        const abscan = `${EXPLORER}/address/${r.address}`;
+        return [
+          '<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">',
+          '  <div>',
+          `    <div class="addr mono" style="font-weight:700">${r.address}</div>`,
+          '    <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">',
+          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>`,
+          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>`,
+          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>`,
+          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>`,
+          '    </div>',
+          '  </div>',
+          '  <div class="links" style="display:flex;gap:8px;flex-shrink:0">',
+          `    <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>`,
+          `    <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>`,
+          '  </div>',
+          '</div>'
+        ].join('');
+      }).join('');
+
+      fundersInner().innerHTML = `
+        <div class="mono" style="margin-bottom:8px">
+          <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
+          Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
+        </div>
+        ${cardsHtml}
+        <div style="margin-top:10px; display:none">
+          <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
+        </div>
+      `;
+
+      const btn = document.getElementById('findCommonBtn');
+      if (btn) btn.onclick = () => findCommonFunders(top.map(x=>x.address));
+
+    } catch(e){
+      fundersInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`;
+    } finally {
+      setScanStatus('Done. Click a wallet row to view funders.');
     }
-
-    const uniq = Array.from(new Set(addrs));
-    const scored=[];
-    for (const a of uniq){
-      const [ethBal, port] = await Promise.all([
-        apiBalance(a).catch(()=>0),
-        tokenPortfolioUsd(a).catch(()=>({ totalUsd:0 }))
-      ]);
-      if ((port.totalUsd||0) > IGNORE_FUNDER_OVER_USD) continue;
-      scored.push({
-        address:a,
-        eth:ethBal,
-        tokenUsd:port.totalUsd||0,
-        meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0}
-      });
-      await sleep(60);
-    }
-
-    scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
-    const top = scored.slice(0, TOP_FUNDER_LIMIT);
-
-    const cardsHtml = top.map((r) => {
-      const portal = `https://portal.abs.xyz/profile/${r.address}`;
-      const abscan = `${EXPLORER}/address/${r.address}`;
-      return [
-        '<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">',
-        '  <div>',
-        `    <div class="addr mono" style="font-weight:700">${r.address}</div>`,
-        '    <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">',
-        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>`,
-        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>`,
-        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>`,
-        `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>`,
-        '    </div>',
-        '  </div>',
-        '  <div class="links" style="display:flex;gap:8px;flex-shrink:0">',
-        `    <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>`,
-        `    <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>`,
-        '  </div>',
-        '</div>'
-      ].join('');
-    }).join('');
-
-    fundersInner().innerHTML = `
-      <div class="mono" style="margin-bottom:8px">
-        <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
-        Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
-      </div>
-      ${cardsHtml}
-      <div style="margin-top:10px; display:none">
-        <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
-      </div>
-    `;
-
-    const btn = document.getElementById('findCommonBtn');
-    if (btn) btn.onclick = () => findCommonFunders(top.map(x=>x.address));
-
-  } catch(e){
-    fundersInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`;
-  } finally {
-    setScanStatus('Done. Click a wallet row to view funders.');
   }
-}
-
-
 
   async function findCommonFunders(addrs){
     showOverlay(commonOverlay());
