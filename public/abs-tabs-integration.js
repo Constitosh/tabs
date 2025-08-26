@@ -1081,4 +1081,4 @@ function renderBubbleGraph(rootEl, graph){
 
   // Expose
   global.TABS_EXT = TABS;
-})(window);
+}(window);
