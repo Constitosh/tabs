@@ -343,7 +343,7 @@ const denomUnits = currentSupplyUnits;
 
      
     // Base supply denominator = sum of all positive balances (excludes burns)
-    const denomUnits = Object.entries(balances)
+  
       .reduce((acc,[addr,bi]) => acc + (bi>0n ? bi : 0n), 0n);
 
 
