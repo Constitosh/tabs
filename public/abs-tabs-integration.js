@@ -590,17 +590,25 @@ function buildGraphFromScan(A, B){
 }
 
 
+// Toggle if you ever want LP bubbles back on the right column
+const SHOW_LP = false;
+
 function renderBubbleGraph(rootEl, graph){
   const EX = graph.explorer || 'https://abscan.org';
   const allNodes = (graph.nodes || []);
+
+  // holders only in this map
   const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
-  const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp'));
+  const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp')); // kept but not drawn while SHOW_LP=false
 
   rootEl.innerHTML = '';
   const width  = rootEl.clientWidth || 960;
   const height = Math.max(560, Math.round(width * 0.48));
 
-  const svg   = d3.select(rootEl).append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+  const svg   = d3.select(rootEl).append('svg')
+    .attr('width', width)
+    .attr('height', height)
+    .style('cursor','grab');
   const rootG = svg.append('g');
 
   // Colors & strokes
@@ -608,50 +616,78 @@ function renderBubbleGraph(rootEl, graph){
   const FILL_LP      = '#8b5cf6';
   const STROKE_LP    = '#c4b5fd';
   const STROKE_DEF   = 'rgba(0,0,0,.35)';
-  const STROKE_PROXY = '#ffd54a'; // via-proxy (bot/router)
   const STROKE_CONN  = '#00d1b2'; // shared funder (non-proxy)
 
-  // Radius by % of supply (sqrt). Make small ones visibly separate.
+  // === per-proxy stroke colors
+  const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>n.proxyId)));
+  const proxyColor = d3.scaleOrdinal()
+    .domain(proxyIds)
+    .range([
+      '#f59e0b', '#60a5fa', '#ef4444', '#10b981', '#a78bfa',
+      '#f472b6', '#22d3ee', '#f43f5e', '#34d399', '#eab308',
+      '#38bdf8', '#fb7185', '#84cc16', '#c084fc'
+    ]);
+
+  // Radius by % of supply (sqrt)
   const maxPct = Math.max(0.0001, ...holders.map(n => +n.pct || 0), ...lps.map(n => +n.pct || 0));
   const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
   holders.forEach(n => n.r = rScale(+n.pct || 0));
   lps.forEach(n => n.r = rScale(+n.pct || 0));
 
-  // Tight pack with extra padding to avoid “stacked” look
-  const pack = d3.pack().size([width*0.8, height*0.9]).padding(6);
+  // 1) Pack to put big ones near the center
+  const pack = d3.pack().size([width*0.8, height*0.9]).padding(8);
   const pRoot = d3.hierarchy({ children: holders }).sum(d => (d && d.r ? d.r * d.r : 1));
   const leaves = pack(pRoot).leaves();
   const seed   = new Map(leaves.map(l => [String(l.data.address).toLowerCase(), l]));
   holders.forEach(n => { const s = seed.get(String(n.address).toLowerCase()); n.x = s ? s.x : 0; n.y = s ? s.y : 0; });
 
-  // Holder cluster bounds
-  const HBOX = { x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
-                 x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r) };
-  HBOX.w = HBOX.x2 - HBOX.x; HBOX.h = HBOX.y2 - HBOX.y;
+  // 2) One-time collision resolve (static — no drifting afterwards)
+  const sim = d3.forceSimulation(holders)
+    .alpha(1)
+    .velocityDecay(0.25)
+    .force('collide', d3.forceCollide(d => (d.r||8) + 3).strength(1)) // +3px gap so bubbles never touch
+    .force('cx', d3.forceX(width*0.4).strength(0.02))
+    .force('cy', d3.forceY(height*0.5).strength(0.02))
+    .stop();
+  for (let i=0;i<140;i++) sim.tick(); // settle, then freeze
 
-  // LP column outside (right)
-  const lpGap = 22;
-  const lpAreaX = HBOX.x2 + lpGap + (width*0.05);
-  let lpY = HBOX.y + 20;
-  lps.forEach(n => { n.x = lpAreaX + n.r; n.y = lpY + n.r; lpY += n.r*2 + 22; });
+  // Optional LP column (kept for later; hidden by SHOW_LP=false)
+  if (SHOW_LP && lps.length){
+    // place to the right of the packed holders
+    const hb = {
+      x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
+      x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r)
+    };
+    const lpGap = 22;
+    const lpAreaX = hb.x2 + lpGap + (width*0.05);
+    let lpY = hb.y + 20;
+    lps.forEach(n => { n.x = lpAreaX + n.r; n.y = lpY + n.r; lpY += n.r*2 + 22; });
+  }
 
-  // Zoom (no simulation)
+  // Zoom (manual; no simulation on drag)
   const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
   svg.call(zoom);
 
-  // Draw nodes
-  const ALL = holders.concat(lps);
+  // Nodes to draw
+  const ALL = SHOW_LP ? holders.concat(lps) : holders;
+
   const nodeSel = rootG.selectAll('g.node').data(ALL, d => d.address).join(enter => {
-    const g = enter.append('g').attr('class','node').attr('transform', d => `translate(${d.x},${d.y})`).style('cursor','pointer');
+    const g = enter.append('g').attr('class','node')
+      .attr('transform', d => `translate(${d.x},${d.y})`)
+      .style('cursor','pointer');
 
     // Base circle
     g.append('circle')
       .attr('r', d => Math.max(8, d.r || 8))
       .attr('fill', d => (d.tags||[]).includes('lp') ? FILL_LP : FILL_HOLDER)
       .attr('fill-opacity', 0.95)
-      .attr('stroke', d => (d.tags||[]).includes('lp') ? STROKE_LP :
-                           (d.proxyId ? STROKE_PROXY : (d.connectId ? STROKE_CONN : STROKE_DEF)))
-      .attr('stroke-width', d => (d.tags||[]).includes('lp') ? 2.5 : (d.proxyId || d.connectId ? 2.5 : 1));
+      .attr('stroke', d => {
+        if ((d.tags||[]).includes('lp')) return STROKE_LP;
+        if (d.proxyId) return proxyColor(d.proxyId);
+        if (d.connectId) return STROKE_CONN;
+        return STROKE_DEF;
+      })
+      .attr('stroke-width', d => ((d.tags||[]).includes('lp') || d.proxyId || d.connectId) ? 2 : 1.2);
 
     // % label (never larger than bubble)
     g.append('text')
@@ -660,27 +696,26 @@ function renderBubbleGraph(rootEl, graph){
       .attr('pointer-events','none')
       .attr('fill','rgba(255,255,255,.88)')
       .attr('font-size', d => {
-        const maxFs = Math.max(8, (d.r||12) * 0.5); // never exceed ~half diameter
+        const maxFs = Math.max(8, (d.r||12) * 0.48); // ≤ ~48% of diameter
         const base  = Math.max(9, Math.min(14, (d.r||14)/3 + 7));
         return Math.min(base, maxFs);
       });
 
-    // Hover – highlight group:
-    //   * via-proxy: all with same proxyId (yellow stroke)
-    //   * connected: all with same connectId (green stroke)
+    // Hover – highlight same proxy group (color varies by proxy) or the shared-funder group
     const tip = getTip();
     g.on('mouseenter', (ev,d)=>{
       if (d.proxyId){
         nodeSel.selectAll('circle').attr('opacity', n => (n.proxyId && n.proxyId===d.proxyId) ? 1 : 0.35);
+        nodeSel.selectAll('circle').attr('stroke-width', n => (n.proxyId && n.proxyId===d.proxyId) ? 3.5 : (((n.tags||[]).includes('lp') || n.connectId) ? 2 : 1.2));
       } else if (d.connectId){
         nodeSel.selectAll('circle').attr('opacity', n => (n.connectId && n.connectId===d.connectId) ? 1 : 0.35);
+        nodeSel.selectAll('circle').attr('stroke-width', n => (n.connectId && n.connectId===d.connectId) ? 3.5 : (((n.tags||[]).includes('lp') || n.proxyId) ? 2 : 1.2));
       }
       tip.html(`
-        <div style="font-weight:700;margin-bottom:4px">${(d.tags||[]).includes('lp') ? 'LP' : ((+d.pct||0).toFixed(2)+'% of supply')}</div>
+        <div style="font-weight:700;margin-bottom:4px">${(+d.pct||0).toFixed(2)}% of supply</div>
         <div><b>Address:</b> ${d.address}</div>
         <div><b>Peak held:</b> ${isFinite(d.peakTokens)? fmtNum(d.peakTokens,6):'—'} tokens</div>
         <div><b>Left:</b> ${isFinite(d.leftTokens)? fmtNum(d.leftTokens,6):'—'} tokens${isFinite(d.leftPct)? ` (${d.leftPct.toFixed(1)}%)` : ''}</div>
-        ${(d.tags && d.tags.length) ? `<div><b>Tags:</b> ${d.tags.join(', ')}</div>` : ''}
         ${d.proxyId  ? `<div class="mono" style="opacity:.85">Proxy group: ${d.proxyId}</div>` : ''}
         ${d.connectId? `<div class="mono" style="opacity:.85">Shared funder: ${d.connectId}</div>` : ''}
         <div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>
@@ -688,7 +723,7 @@ function renderBubbleGraph(rootEl, graph){
     }).on('mousemove', (ev)=>{
       getTip().style('left',(ev.clientX+12)+'px').style('top',(ev.clientY+12)+'px');
     }).on('mouseleave', ()=>{
-      nodeSel.selectAll('circle').attr('opacity', 1);
+      nodeSel.selectAll('circle').attr('opacity', 1).attr('stroke-width', d => ((d.tags||[]).includes('lp') || d.proxyId || d.connectId) ? 2 : 1.2);
       getTip().style('opacity',0);
     });
 
@@ -696,7 +731,7 @@ function renderBubbleGraph(rootEl, graph){
     return g;
   });
 
-  // Fit-to-view once
+  // Fit view once (holders only)
   fitToView();
   function fitToView(){
     const bbox = rootG.node().getBBox();
@@ -729,6 +764,7 @@ function renderBubbleGraph(rootEl, graph){
     return Number(n).toLocaleString(undefined,{ maximumFractionDigits:d });
   }
 }
+
 
 
 
