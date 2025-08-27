@@ -110,6 +110,27 @@
   }
   footer .wrap{ position:relative; z-index:1; }
 
+   /* Make the overlay card comfortably tall and spaced for the extra button */
+.overlay-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 22px;
+  min-height: 220px; /* increased vertical size */
+}
+
+/* Full-width buttons look great in this modal */
+#visionBtn,
+#bootRetry {
+  width: 100%;
+}
+
+/* A little breathing room above/below the progress bar */
+.overlay-card .progress {
+  margin: 4px 0 8px;
+}
+
+
   /* A: stat rows look */
   #aTokenStats{margin-bottom:8px}
   #aTokenStats .statrow{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px dashed rgba(255,255,255,.10)}
@@ -285,18 +306,25 @@
     </div>
   </div>
 
-  <!-- Boot overlay with progress -->
-  <div class="overlay" id="bootOverlay">
-    <div class="overlay-card">
-      <h4 class="mono">Loading latest snapshot…</h4>
-      <div class="banner mono">
-        <span class="spinner"></span>
-        <span id="bootStatus">Starting…</span>
-      </div>
-      <div class="progress"><div id="bootBar"></div></div>
-      <button id="bootRetry" class="btn mono">Retry</button>
+<!-- Boot overlay with progress -->
+<div class="overlay" id="bootOverlay">
+  <div class="overlay-card">
+    <h4 class="mono">Loading latest snapshot…</h4>
+
+    <div class="banner mono">
+      <span class="spinner"></span>
+      <span id="bootStatus">Starting…</span>
     </div>
+
+    <!-- NEW: Vision Board button -->
+    <a id="visionBtn" class="btn mono" href="/vision.html">Check out our Vision Board</a>
+
+    <div class="progress"><div id="bootBar"></div></div>
+
+    <button id="bootRetry" class="btn mono">Retry</button>
   </div>
+</div>
+
 
   <footer>
     <div class="wrap mono">
