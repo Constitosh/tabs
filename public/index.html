@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>$tABS — Token Platform</title>
-   <link rel="icon" type="image/png" href="https://cdn.dexscreener.com/cms/images/4GoBllwMTEijvbAI?width=64&height=64&quality=90">
+<link rel="icon" type="image/png" href="https://cdn.dexscreener.com/cms/images/4GoBllwMTEijvbAI?width=64&height=64&quality=90">
 <style>
   :root{ --abs-green:#07c160; --bg:#0b1f17; --panel:#0f2a20; --muted:#89b6a0; --text:#e8fff3; --danger:#ff6b6b; --info:#5aa7ff; }
   *{box-sizing:border-box}
@@ -18,21 +18,6 @@
   }
   main{flex:1 0 auto} footer{flex-shrink:0}
 
-   .overlay-card {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 20px 22px;
-  min-height: 240px; /* give extra vertical space */
-}
-
-#visionBtn,
-#bootRetry {
-  width: 100%;
-}
-
-
-   
   .mono, table, .hstat b, .tag, .pill, .muted, h2, .tabbtn { font-family:"Liberation Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important; }
   a{color:inherit;text-decoration:none}
 
@@ -87,6 +72,20 @@
   .expander.open .tray{display:block}
   .expander.open > button{color:#d9ffe8}
 
+.overlay-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 22px;
+  min-height: 240px; /* give extra vertical space */
+}
+
+#visionBtn,
+#bootRetry {
+  width: 100%;
+}
+
+
   /* A + B grid */
   .below-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
   .box{background:linear-gradient(135deg, rgba(7,193,96,.08), rgba(7,193,96,.02));border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;min-height:220px;overflow-x:auto}
@@ -124,27 +123,6 @@
     z-index:0;
   }
   footer .wrap{ position:relative; z-index:1; }
-
-   /* Make the overlay card comfortably tall and spaced for the extra button */
-.overlay-card {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 20px 22px;
-  min-height: 220px; /* increased vertical size */
-}
-
-/* Full-width buttons look great in this modal */
-#visionBtn,
-#bootRetry {
-  width: 100%;
-}
-
-/* A little breathing room above/below the progress bar */
-.overlay-card .progress {
-  margin: 4px 0 8px;
-}
-
 
   /* A: stat rows look */
   #aTokenStats{margin-bottom:8px}
@@ -193,6 +171,7 @@
   .progress{ width:100%; height:10px; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.12); border-radius:999px; overflow:hidden; margin-top:10px; }
   .progress > div{ height:100%; width:0%; background:linear-gradient(90deg, var(--abs-green), #32d896); transition:width .35s ease; }
   #bootRetry{ display:none; margin-top:10px; }
+   
 </style>
 </head>
 <body>
@@ -344,16 +323,6 @@
 </div>
 
 
-    <!-- NEW: Vision Board button -->
-    <a id="visionBtn" class="btn mono" href="/vision.html">Check out our Vision Board</a>
-
-    <div class="progress"><div id="bootBar"></div></div>
-
-    <button id="bootRetry" class="btn mono">Retry</button>
-  </div>
-</div>
-
-
   <footer>
     <div class="wrap mono">
       <p style="font-size:0.8rem;color:#777;margin-top:1rem;">
@@ -370,12 +339,11 @@
 
 <!-- ===== App bootstrap (namespaced + guarded) ===== -->
 <script defer src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
+<script>
+  window.__USE_AUTO_WRAP_BUBBLES = true;
+</script>
+
 <script defer src="/abs-tabs-integration.js"></script>
-   
-
-   
-
-
 <script>
 (function(){
   if (window.TABS_APP) { console.warn('TABS_APP already loaded'); return; }
