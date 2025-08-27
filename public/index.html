@@ -347,7 +347,18 @@
 <script>
 (function(){
   if (window.TABS_APP) { console.warn('TABS_APP already loaded'); return; }
-
+window.TABS_BRIDGE = {
+    setSupplyBasis(ca, supply) {
+      if (ca && Number.isFinite(supply)) {
+        Bundles.setPercentBasis(ca.toLowerCase(), Number(supply));
+      }
+    },
+    setTransfers(ca, txs) {
+      if (ca && Array.isArray(txs)) {
+        Bundles.setTxs(ca.toLowerCase(), txs);
+      }
+    }
+  };
   const SPECIAL_CA = '0x8C3d850313EB9621605cD6A1ACb2830962426F67'.toLowerCase();
 
   /* utils */
@@ -436,6 +447,7 @@
   async function renderSingle(ca){
     enterSingleTokenMode(); currentCA=ca.toLowerCase();
     document.getElementById('expander').style.display='none';
+    
     try{
       const j=await addToken(currentCA);
       if(!j.ok || !j.row){
@@ -453,6 +465,21 @@
     // Kick off the deep scan (A+B) — cache-first
     window.TABS_EXT && window.TABS_EXT.startScan(currentCA);
   }
+ // >>> BUNDLES HOOKS (add this) <<<
+    // If TABS_EXT exposes these callbacks, forward data to the bundles layer:
+    if (window.TABS_EXT) {
+      // Current Supply (est) -> use as % basis for bubbles
+      window.TABS_EXT.onSupplyBasis = (supplyTokens) => {
+        TABS_BRIDGE.setSupplyBasis(currentCA, supplyTokens);
+      };
+      // Transfers array -> enables bundle detection + first-50 analysis
+      window.TABS_EXT.onTransfers = (txsArray) => {
+        TABS_BRIDGE.setTransfers(currentCA, txsArray);
+      };
+    }
+    // <<< BUNDLES HOOKS END <<<
+  }
+
   async function startSingleFromIcon(ca){ document.getElementById('search').value=ca; await renderSingle(ca); }
 
   async function updateHeaderForSpecialToken(){
@@ -564,6 +591,25 @@
 document.addEventListener('DOMContentLoaded', () => {
   if (window.__ABS_BOOTED__) return; window.__ABS_BOOTED__ = true;
   window.TABS_EXT?.init();
+  // >>> BUNDLES HOOKS SAFETY (add this) <<<
+  // If TABS_EXT appears slightly later, attach our forwarders once it exists.
+  (function waitAndAttachHooks(tries=0){
+    if (window.TABS_EXT) {
+      // Keep last CA if user is already in single-token mode
+      const ca = (window.TABS_APP && window.TABS_APP.currentCA) || null;
+
+      window.TABS_EXT.onSupplyBasis = (supplyTokens) => {
+        if (ca) TABS_BRIDGE.setSupplyBasis(ca, supplyTokens);
+      };
+      window.TABS_EXT.onTransfers = (txsArray) => {
+        if (ca) TABS_BRIDGE.setTransfers(ca, txsArray);
+      };
+      return;
+    }
+    if (tries < 25) setTimeout(() => waitAndAttachHooks(tries+1), 200);
+  })();
+  // <<< BUNDLES HOOKS SAFETY END <<<
+
   window.TABS_APP?.boot();
 });
 </script>
