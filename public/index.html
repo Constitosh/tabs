@@ -478,9 +478,8 @@ window.TABS_BRIDGE = {
       };
     }
     // <<< BUNDLES HOOKS END <<<
-  }
 
-  async function startSingleFromIcon(ca){ document.getElementById('search').value=ca; await renderSingle(ca); }
+async function startSingleFromIcon(ca){ document.getElementById('search').value=ca; await renderSingle(ca); }
 
   async function updateHeaderForSpecialToken(){
     try{
@@ -586,9 +585,14 @@ window.TABS_BRIDGE = {
   document.getElementById('search').addEventListener('input', async ()=>{ if(single) return; await renderByMode(); });
 
   // expose for icon click handler
-  window.TABS_APP = { boot, startSingleFromIcon };
+  window.TABS_APP = { 
+    boot, 
+    startSingleFromIcon,
+    get currentCA(){ return currentCA; }
+  };
 })();
 document.addEventListener('DOMContentLoaded', () => {
+
   if (window.__ABS_BOOTED__) return; window.__ABS_BOOTED__ = true;
   window.TABS_EXT?.init();
   // >>> BUNDLES HOOKS SAFETY (add this) <<<
