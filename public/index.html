@@ -1,6 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <script>
+window.addEventListener('unhandledrejection', (e) => {
+  const msg = String(e.reason && (e.reason.message || e.reason)) || '';
+  if (msg.includes('Internal JSON-RPC error')) { e.preventDefault(); console.warn('Ignoring wallet JSON-RPC error at boot:', e.reason); }
+});
+</script>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>$tABS — Token Platform</title>
