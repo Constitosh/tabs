@@ -34,6 +34,17 @@
   const aBubble = () => $('#bubble-canvas');
   const aBubbleNote = () => $('#a-bubble-note');
 
+// ==== Bubble sizing helper (reads the actual canvas size) ====
+function bubbleCanvasSize(){
+  const el = document.getElementById('bubble-canvas');
+  if (!el) return { W: 960, H: 540 };
+  const W = el.clientWidth || 960;
+  const H = Math.max(el.clientHeight || 0, Math.round(W * 0.5));
+  return { W, H };
+}
+
+
+   
   // Container B
   const bStatusGrid = () => $('#statusGrid');
   const firstBtn = () => $('#btnFirst25');
@@ -161,49 +172,70 @@
     return { totalUsd: total };
   }
 
-  // ======== Bubble map (D3) ========
-  function renderBubble({ root, holders, extras }){
-    root.innerHTML='';
-    const width = root.clientWidth || 960;
-    const height = Math.max(600, Math.round(width * 0.45));
-    const data = (holders||[]).concat(extras || []);
-    const svg = d3.select(root).append('svg').attr('width', width).attr('height', height);
-    const pack = d3.pack().size([width,height]).padding(3);
-    const droot = d3.hierarchy({ children:data }).sum(d=>Math.max(0.000001, d.balance||0));
-    const nodes = pack(droot).leaves();
+// ======== Bubble map (D3) ========
+let _lastBubbleInput = null;     // keep last data to re-render on resize
+let _resizeRaf = null;
 
-    let tip = d3.select('#bubble-tip');
-    if (tip.empty()){
-      tip = d3.select('body').append('div').attr('id','bubble-tip')
-        .style('position','fixed').style('background','#111').style('color','#fff')
-        .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
-        .style('pointer-events','none').style('opacity',0).style('z-index',9999)
-        .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
-    }
-    const fillFor = (d)=> d.data.__type==='lp' ? '#8B5CF6' : '#375a4e';
+function renderBubble({ root, holders, extras }){
+  _lastBubbleInput = { root, holders, extras };    // remember for resize()
 
-    const g = svg.selectAll('g').data(nodes).enter().append('g').attr('transform',d=>`translate(${d.x},${d.y})`);
-    g.append('circle')
-      .attr('r', d=>d.r).attr('fill', fillFor)
-      .attr('stroke', d=> d.data.__type==='lp' ? '#C4B5FD' : null)
-      .attr('stroke-width', d=> d.data.__type==='lp' ? 2.5 : null)
-      .on('mouseover', (e,d)=>{
-        const pct=(d.data.pct||0).toFixed(4);
-        tip.html(d.data.__type==='lp'
-          ? `<div><strong>LP</strong> — <span class="mono">${pct}%</span> of supply</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
-          : `<div><strong><span class="mono">${pct}%</span> of supply</strong></div><div>${d.data.address.slice(0,6)}…${d.data.address.slice(-4)}</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
-        ).style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px').style('opacity',1);
-      })
-      .on('mousemove', (e)=> d3.select('#bubble-tip').style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px'))
-      .on('mouseout', ()=> d3.select('#bubble-tip').style('opacity',0))
-      .on('click', (e,d)=> window.open(`${EXPLORER}/address/${d.data.address}`,'_blank'));
+  root.innerHTML = '';
+  const { W, H } = bubbleCanvasSize();
+  const data = (holders || []).concat(extras || []);
 
-    g.append('text')
-      .attr('dy','.35em').style('text-anchor','middle')
-      .style('font-size', d=> Math.min(d.r*0.45, 16)).style('fill','#fff')
-      .style('pointer-events','none').classed('mono', true)
-      .text(d=> d.data.__type==='lp' ? 'LP' : `${(d.data.pct||0).toFixed(2)}%`);
+  // responsive SVG that follows container size
+  const svg = d3.select(root)
+    .append('svg')
+    .attr('width', '100%')
+    .attr('height', '100%')
+    .attr('preserveAspectRatio', 'xMidYMid meet')
+    .attr('viewBox', `0 0 ${W} ${H}`);
+
+  const pack = d3.pack().size([W, H]).padding(3);
+  const droot = d3.hierarchy({ children: data }).sum(d => Math.max(0.000001, d.balance || 0));
+  const nodes = pack(droot).leaves();
+
+  let tip = d3.select('#bubble-tip');
+  if (tip.empty()){
+    tip = d3.select('body').append('div').attr('id','bubble-tip')
+      .style('position','fixed').style('background','#111').style('color','#fff')
+      .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
+      .style('pointer-events','none').style('opacity',0).style('z-index',9999)
+      .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
   }
+  const fillFor = (d)=> d.data.__type==='lp' ? '#8B5CF6' : '#375a4e';
+
+  const g = svg.selectAll('g').data(nodes).enter().append('g').attr('transform', d => `translate(${d.x},${d.y})`);
+
+  g.append('circle')
+    .attr('r', d => d.r).attr('fill', fillFor)
+    .attr('stroke', d => d.data.__type==='lp' ? '#C4B5FD' : null)
+    .attr('stroke-width', d => d.data.__type==='lp' ? 2.5 : null)
+    .on('mouseover', (e,d)=>{
+      const pct=(d.data.pct||0).toFixed(4);
+      tip.html(d.data.__type==='lp'
+        ? `<div><strong>LP</strong> — <span class="mono">${pct}%</span> of supply</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
+        : `<div><strong><span class="mono">${pct}%</span> of supply</strong></div><div>${d.data.address.slice(0,6)}…${d.data.address.slice(-4)}</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
+      ).style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px').style('opacity',1);
+    })
+    .on('mousemove', (e)=> d3.select('#bubble-tip').style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px'))
+    .on('mouseout', ()=> d3.select('#bubble-tip').style('opacity',0))
+    .on('click', (e,d)=> window.open(`${EXPLORER}/address/${d.data.address}`,'_blank'));
+
+  g.append('text')
+    .attr('dy','.35em').style('text-anchor','middle')
+    .style('font-size', d=> Math.min(d.r*0.45, 16)).style('fill','#fff')
+    .style('pointer-events','none').classed('mono', true)
+    .text(d=> d.data.__type==='lp' ? 'LP' : `${(d.data.pct||0).toFixed(2)}%`);
+}
+
+// Expose a resize that re-renders with the new container size
+TABS.resize = function(){
+  if (!_lastBubbleInput) return;
+  if (_resizeRaf) cancelAnimationFrame(_resizeRaf);
+  _resizeRaf = requestAnimationFrame(()=> renderBubble(_lastBubbleInput));
+};
+
 
   // ======== Persistence API (server) ========
   async function loadCachedScan(ca){
