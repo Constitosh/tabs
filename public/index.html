@@ -190,6 +190,13 @@
 #panelOverlay .overlay-card { width:min(98vw,1600px); max-height:92vh; }  /* bigger panel */
 .box.fullscreen #bubble-canvas { min-height:72vh; }           /* bigger bubble map area */
 
+/* Bubble view: go BIG in overlay */
+#panelOverlay .overlay-card { width: min(98vw, 1800px); max-height: 92vh; }
+.box.fullscreen { width: 100%; }
+.box.fullscreen #bubble-canvas { min-height: 78vh; }   /* taller canvas area */
+
+/* Ensure the bubble SVG fills its box */
+#bubble-canvas svg { width: 100% !important; height: 100% !important; display: block; }
 
   /* ========= BOOT OVERLAY + PROGRESS BAR ========= */
   #bootOverlay{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.6); z-index:120; }
@@ -587,17 +594,35 @@ function openPanelOverlay(fromEl){
   // move + enlarge
   panelSlot.innerHTML = '';
   panelSlot.appendChild(fromEl);
-  fromEl.classList.add('fullscreen');               // <— hide + and enlarge
+  fromEl.classList.add('fullscreen');               // hide + and enlarge
   panelOverlay.style.display = 'flex';
+
+  // If this is Panel A (bubble view), trigger resize + zoom wiring
+  if (fromEl.id === 'boxLeft') {
+    // give layout a tick to compute sizes, then nudge any responsive render
+    setTimeout(()=>{
+      window.dispatchEvent(new Event('resize'));     // for responsive charts that listen to resize
+      window.TABS_EXT?.resize?.();                   // if your integration exposes a resize()
+      wireBubbleZoom();                              // add zoom/pan if not already
+    }, 0);
+  }
 
   restore = ()=>{
     if (ph.parentNode){
       ph.parentNode.insertBefore(fromEl, ph);
       ph.remove();
     }
-    fromEl.classList.remove('fullscreen');          // <— show + again, restore size
+    fromEl.classList.remove('fullscreen');          // show + again, restore size
     panelOverlay.style.display='none';
     restore=null;
+
+    if (fromEl.id === 'boxLeft') {
+      // reflow back in place (optional, harmless if no-op)
+      setTimeout(()=>{
+        window.dispatchEvent(new Event('resize'));
+        window.TABS_EXT?.resize?.();
+      }, 0);
+    }
   };
 }
 
@@ -606,6 +631,40 @@ panelOverlay?.addEventListener('click', (e)=>{ if(e.target===panelOverlay){ rest
 
 document.getElementById('expandA')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxLeft')));
 document.getElementById('expandB')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxRight')));
+
+/* ---------- Bubble zoom/pan (D3) ---------- */
+let bubbleZoomWired = false;
+function wireBubbleZoom(){
+  if (bubbleZoomWired) return;
+  const svgEl = document.querySelector('#bubble-canvas svg');
+  if (!svgEl || !window.d3) return;
+
+  const svg = d3.select(svgEl);
+
+  // Find or create a wrapper <g> to transform
+  let host = svg.select('g.zoomhost');
+  if (host.empty()){
+    // If a main <g> already exists, reuse it as host; else wrap all children
+    const firstG = svg.select('g');
+    if (!firstG.empty() && !firstG.classed('zoomhost')) {
+      firstG.classed('zoomhost', true);
+      host = firstG;
+    } else {
+      host = svg.append('g').attr('class','zoomhost');
+      // move existing children under the host
+      const kids = Array.from(svgEl.childNodes)
+        .filter(n => n.nodeType===1 && !(n.tagName.toLowerCase()==='g' && n.classList.contains('zoomhost')));
+      kids.forEach(n => host.node().appendChild(n));
+    }
+  }
+
+  const zoom = d3.zoom()
+    .scaleExtent([0.5, 8])      // min/max zoom
+    .on('zoom', (ev)=> { host.attr('transform', ev.transform); });
+
+  svg.call(zoom);
+  bubbleZoomWired = true;
+}
 
 
   /* ---------- Dexscreener chart overlay ---------- */
