@@ -38,10 +38,20 @@
 function bubbleCanvasSize(){
   const el = document.getElementById('bubble-canvas');
   if (!el) return { W: 960, H: 540 };
+
   const W = el.clientWidth || 960;
-  const H = Math.max(el.clientHeight || 0, Math.round(W * 0.5));
+
+  // Detect overlay (fullscreen) vs normal
+  const isFull = !!(el.closest('#boxLeft')?.classList.contains('fullscreen'));
+
+  // Tuned ratios + minimums
+  const ratio = isFull ? 0.62 : 0.40;   // overlay ~62% of width; normal ~40%
+  const minH  = isFull ? 520  : 300;    // hard mins for each mode
+
+  const H = Math.max(el.clientHeight || 0, Math.round(W * ratio), minH);
   return { W, H };
 }
+
 
 
    
