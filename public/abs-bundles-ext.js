@@ -1,159 +1,135 @@
+/*! abs-bundles-ext vB.4 — safe loader
+ *  - Non-blocking: waits for bubble nodes, never throws, won't affect rendering if nothing is ready.
+ *  - Option B: (first 100 buyers + top 100 holders) when helpers are present.
+ */
+(function(){
+  const VERSION = 'vB.4';
+  const log = (...a)=>console.log('[bundles-ext '+VERSION+']', ...a);
+  const warn = (...a)=>console.warn('[bundles-ext '+VERSION+']', ...a);
 
-/* abs-bundles-ext.js — Option B bundles (first 100 buyers + top 100 holders), non-invasive
-   - No dependency on internal vars; works if `getFundingWallets(tokenCA, address)` is present.
-   - Persists funders aggregate via /api/funders/batch.
-   - Colors bubbles by bundle and highlights group on hover.
-   - Defensive: never throws; logs a small version banner.
-*/
-(function(global){
-  console.log('%cabs-bundles-ext vB.3 loaded','color:#0f0');
-  const $ = (s)=>document.querySelector(s);
-  const sleep = (ms)=> new Promise(r=> setTimeout(r,ms));
-  const CONCURRENCY = 3;
-  const MAX_FIRST = 100;
-  const MAX_TOP = 100;
-  const COLORS = ['#7bd389','#59a5d8','#f7a072','#f28482','#c4a7e7','#8bd3dd','#ffd166','#06d6a0','#a0c4ff','#ffadad'];
+  fetch('/api/snapshot/latest', { cache:'no-store' }).then(r=>{
+    if (!r.ok) warn('backend not OK', r.status);
+    else log('backend OK');
+  }).catch(()=>warn('backend unreachable'));
 
-  function hash(a){ try{return (a||'').toLowerCase();}catch{return a;} }
-  function chooseColor(i){ return COLORS[i % COLORS.length]; }
+  function lower(s){ try{return (s||'').toLowerCase();}catch{return s} }
 
-  function readHoldersFromBubbles(){
-    const root = $('#bubble-canvas');
-    if (!root) return [];
-    const nodes = root.querySelectorAll('[data-address]');
-    const arr = [];
+  function getTokenCA(){
+    try {
+      if (window.__currentTokenRow?.baseAddress) return lower(window.__currentTokenRow.baseAddress);
+      const caEl = document.querySelector('[data-token-ca]');
+      if (caEl) return lower(caEl.getAttribute('data-token-ca'));
+      const card = Array.from(document.querySelectorAll('.card b'))
+        .map(el=>el.textContent.trim())
+        .find(t=>/^0x[0-9a-fA-F]{40}$/.test(t));
+      if (card) return lower(card);
+    } catch(e){}
+    return '';
+  }
+
+  function collectBubbles(){
+    const root = document.getElementById('bubble-canvas');
+    if (!root) return { root:null, nodes:[] };
+    const nodes = root.querySelectorAll('[data-address], [data-addr], [role="bubble"], circle');
+    return { root, nodes: Array.from(nodes) };
+  }
+
+  function ensureDataAddress(nodes){
     nodes.forEach(n=>{
-      const address = n.getAttribute('data-address');
-      if (!address) return;
-      // try to read pct from text content like "1.23%"
-      let pct = 0;
-      const t = (n.textContent||'').trim();
-      const m = t.match(/([0-9]+(?:\.[0-9]+)?)\s*%/);
-      if (m) pct = parseFloat(m[1]);
-      arr.push({ address: hash(address), balancePct: pct });
-    });
-    // sort desc pct
-    arr.sort((a,b)=> (b.balancePct-a.balancePct));
-    return arr;
-  }
-
-  function readFirstBuyers(){
-    // best-effort: if page exposes first25 list
-    const lst = global.first25 || global.__first25 || [];
-    return Array.isArray(lst) ? lst.map(x => ({ address: hash(x.address || x.buyer || x.addr || x.wallet || x[0] || '') })).filter(x=>x.address) : [];
-  }
-
-  function waitForBubbles(timeoutMs=8000){
-    const root = $('#bubble-canvas');
-    if (!root) return null;
-    const nodes = root.querySelectorAll('[data-address], circle');
-    if (nodes.length>20) return root;
-    const start = Date.now();
-    return new Promise(async (resolve)=>{
-      const mo = new MutationObserver(()=>{
-        const nds = root.querySelectorAll('[data-address], circle');
-        if (nds.length>20){ mo.disconnect(); resolve(root); }
-      });
-      mo.observe(root, { childList:true, subtree:true });
-      const tick = async ()=>{
-        while(Date.now()-start < timeoutMs){
-          await sleep(200);
-          const nds = root.querySelectorAll('[data-address], circle');
-          if (nds.length>20){ mo.disconnect(); resolve(root); return; }
-        }
-        mo.disconnect(); resolve(root);
-      };
-      tick();
+      if (!n.getAttribute) return;
+      if (!n.getAttribute('data-address')){
+        const a = n.getAttribute('data-addr') || n.getAttribute('data-wallet') || n.getAttribute('data-id') || '';
+        if (/^0x[0-9a-f]{40}$/i.test(a)) n.setAttribute('data-address', lower(a));
+      }
     });
   }
 
-  async function resolveFunders(tokenCA, holders, firstBuyers){
-    const top = holders.slice(0, MAX_TOP);
-    const first = firstBuyers.slice(0, MAX_FIRST);
-    const addrs = Array.from(new Set([...top.map(h=>h.address), ...first.map(f=>f.address)])).filter(Boolean);
-    if (!addrs.length) return new Map();
-    if (typeof global.getFundingWallets !== 'function'){
-      console.warn('[bundles] getFundingWallets not found. Skipping live resolve.');
+  async function resolveBundles(tokenCA, addresses){
+    if (typeof window.getFundingWallets !== 'function'){
+      warn('getFundingWallets(...) helper not found; skipping bundle resolve.');
       return new Map();
     }
-    // simple pool
-    let i=0, active=0; const results=[]; const tasks=[];
-    function run(){
-      while(active<CONCURRENCY && i<addrs.length){
-        const a = addrs[i++]; active++;
-        tasks.push((async()=>{
+    const uniq = Array.from(new Set(addresses.map(lower))).slice(0,200);
+    const CONC = 3;
+    let i=0, active=0;
+    const results=[];
+
+    const runNext=()=>{
+      while(active<CONC && i<uniq.length){
+        const addr = uniq[i++];
+        active++;
+        (async()=>{
           try{
-            const r = await global.getFundingWallets(tokenCA, a);
+            const r = await window.getFundingWallets(tokenCA, addr);
             if (r && r.funder){
-              results.push({ funder: hash(r.funder), buyer: a, amountInETH:Number(r.amountInETH||0), amountOutETH:Number(r.amountOutETH||0), firstTs:r.firstTs||0 });
+              results.push({ funder: lower(r.funder), buyer: lower(addr),
+                amountInETH: Number(r.amountInETH||0), amountOutETH: Number(r.amountOutETH||0), firstTs: r.firstTs||0 });
             }
           }catch(e){}
-          active--; run();
-        })());
+          active--; runNext();
+        })();
       }
-    }
-    run();
-    await Promise.all(tasks);
+    };
+    await new Promise(res=>{ runNext(); const t=setInterval(()=>{ if(active===0 && i>=uniq.length){clearInterval(t);res();}},50);});
+
     if (results.length){
-      try{
-        await fetch('/api/funders/batch', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ tokenCA, entries: results }) });
-      }catch(e){ console.warn('persist failed', e); }
+      fetch('/api/funders/batch',{
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body: JSON.stringify({ tokenCA, entries: results })
+      }).catch(()=>{});
     }
-    const byFunder = new Map();
-    for (const r of results){
-      const g = byFunder.get(r.funder) || { buyers:new Set() };
-      g.buyers.add(r.buyer); byFunder.set(r.funder, g);
+
+    const by=new Map();
+    for(const r of results){
+      const g=by.get(r.funder)||{funder:r.funder,buyers:new Set()};
+      g.buyers.add(r.buyer);
+      by.set(r.funder,g);
     }
-    return byFunder;
+    return by;
   }
 
-  function applyBundleColors(root, bundles){
-    const keys = Array.from(bundles.keys());
-    keys.forEach((k, idx)=>{
-      const col = chooseColor(idx);
-      const buyers = bundles.get(k).buyers || new Set();
-      buyers.forEach(addr=>{
-        const el = root.querySelector(`[data-address="${addr}"]`);
-        if (!el) return;
-        el.style.stroke = col; el.style.strokeWidth = '2px';
-        el.addEventListener('mouseenter', ()=>{
-          buyers.forEach(a2=>{
-            const n = root.querySelector(`[data-address="${a2}"]`);
-            if (n){ n.style.filter='brightness(1.5)'; n.style.opacity='1'; }
-          });
-          root.querySelectorAll('[data-address]').forEach(n=>{
-            const a = n.getAttribute('data-address');
-            if (!buyers.has(a)){ n.style.opacity='0.25'; n.style.filter='grayscale(0.7)'; }
-          });
+  function colorize(root,bundles){
+    const COLORS=['#7bd389','#59a5d8','#f7a072','#f28482','#c4a7e7','#8bd3dd','#ffd166','#06d6a0','#a0c4ff','#ffadad'];
+    Array.from(bundles.keys()).forEach((k,idx)=>{
+      const g=bundles.get(k);
+      const col=COLORS[idx%COLORS.length];
+      g.buyers.forEach(addr=>{
+        const el=root.querySelector(`[data-address="${addr}"]`);
+        if(!el) return;
+        el.style.stroke=col; el.style.strokeWidth='2px';
+        el.addEventListener('mouseenter',()=>{
+          g.buyers.forEach(a=>{ const n=root.querySelector(`[data-address="${a}"]`); if(n){n.style.filter='brightness(1.5)'; n.style.opacity='1';}});
+          root.querySelectorAll('[data-address]').forEach(n=>{ const a=n.getAttribute('data-address'); if(!g.buyers.has(a)){n.style.opacity='0.25'; n.style.filter='grayscale(0.7)';}});
         });
-        el.addEventListener('mouseleave', ()=>{
-          root.querySelectorAll('[data-address]').forEach(n=>{ n.style.opacity=''; n.style.filter=''; });
-        });
+        el.addEventListener('mouseleave',()=>{ root.querySelectorAll('[data-address]').forEach(n=>{ n.style.opacity=''; n.style.filter='';}); });
       });
     });
   }
 
-  async function main(){
-    const root = await waitForBubbles();
-    if (!root) return;
-    // ensure data-address population: copy from plausible fallbacks
-    root.querySelectorAll('circle').forEach(n=>{
-      if (!n.getAttribute('data-address')){
-        const a = n.getAttribute('data-addr') || n.getAttribute('data-wallet') || n.getAttribute('data-id');
-        if (a) n.setAttribute('data-address', hash(a));
+  function startWhenReady(){
+    let tries=0; const maxTries=100;
+    const iv=setInterval(async()=>{
+      tries++;
+      const {root,nodes}=collectBubbles();
+      if(!root||nodes.length===0){
+        if(tries%20===0) log('waiting for bubble nodes…');
+        if(tries>=maxTries){ clearInterval(iv); warn('no bubbles found; giving up'); }
+        return;
       }
-    });
-    // obtain tokenCA if page exposes it
-    const tokenCA = (global.__currentTokenRow && (global.__currentTokenRow.baseAddress||global.__currentTokenRow.address)) || (global.CURRENT_TOKEN && CURRENT_TOKEN.address) || '';
-    // holders + first buyers (best-effort)
-    const holders = readHoldersFromBubbles();
-    const first = readFirstBuyers();
-    if (!tokenCA || !holders.length) return;
-    const bundles = await resolveFunders(tokenCA, holders, first);
-    applyBundleColors(root, bundles);
+      clearInterval(iv);
+      ensureDataAddress(nodes);
+      const addresses=nodes.map(n=>(n.getAttribute&&n.getAttribute('data-address'))||'').filter(Boolean);
+      const tokenCA=getTokenCA();
+      if(!tokenCA){ warn('token CA not detected; skip bundles'); return; }
+      try{
+        const bundles=await resolveBundles(tokenCA,addresses);
+        if(bundles.size>0) colorize(root,bundles);
+        else log('no bundles resolved');
+      }catch(e){ warn('bundle step failed',e); }
+    },100);
   }
 
-  // Run once page is interactive
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', main);
-  else main();
-})(window);
+  window.addEventListener('DOMContentLoaded', startWhenReady);
+  log('loaded');
+})();
