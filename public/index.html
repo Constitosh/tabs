@@ -192,6 +192,22 @@
 .box.fullscreen .expand-btn { background:rgba(255,255,255,.10); }
 
 
+/* Bubble view wider in overlay (Panel A only) */
+#panelOverlay #boxLeft.fullscreen { width: 100%; }
+
+#panelOverlay #boxLeft.fullscreen #bubble-canvas{
+  width: 90%;           /* <-- make the bubble area 90% of overlay */
+  margin: 0 auto;       /* <-- center it */
+  min-height: 78vh;     /* keep it tall */
+}
+
+/* Optional: align the stats row width with the bubble canvas */
+#panelOverlay #boxLeft.fullscreen #aTokenStats{
+  width: 90%;
+  margin: 0 auto 8px;
+}
+
+  
 /* Make overlay card bigger (bubble view) */
 #panelOverlay .overlay-card { width:min(98vw, 1800px); max-height:92vh; }
 .box.fullscreen { width: 100%; }
