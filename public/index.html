@@ -72,26 +72,31 @@
   .expander.open .tray{display:block}
   .expander.open > button{color:#d9ffe8}
 
-.overlay-card {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 20px 22px;
-  min-height: 240px; /* give extra vertical space */
-}
+  .overlay-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 20px 22px;
+    min-height: 240px;
+  }
 
-#visionBtn,
-#bootRetry {
-  width: 100%;
-}
-
+  #visionBtn,
+  #bootRetry { width: 100%; }
 
   /* A + B grid */
   .below-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  .box{background:linear-gradient(135deg, rgba(7,193,96,.08), rgba(7,193,96,.02));border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;min-height:220px;overflow-x:auto}
+  .box{background:linear-gradient(135deg, rgba(7,193,96,.08), rgba(7,193,96,.02));border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;min-height:220px;overflow-x:auto; position:relative; }
   .box h3{margin:0 0 8px}
   #bubble-canvas{min-height:220px}
   @media (max-width: 900px) { .below-grid{grid-template-columns:1fr} }
+
+  /* Expand (“+”) button in panels */
+  .expand-btn{
+    position:absolute; top:10px; right:10px;
+    width:34px; height:34px; border-radius:10px;
+    border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06);
+    color:#d9ffe8; cursor:pointer; font-weight:900; line-height:1;
+  }
 
   /* B: status grid responsive (5x5 → 3x? on narrow) */
   .status-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:10px}
@@ -100,10 +105,20 @@
   .s-tag{padding:2px 8px;border-radius:14px;border:1px solid rgba(255,255,255,.18);font-size:.75rem}
   .s-hold{color:#3ee98f}.s-more{color:#ffd166}.s-part{color:#6cf0ff}.s-sold{color:#ff8585}
 
-  /* Overlays (funders/common) */
-  .overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6);z-index:60}
-  .overlay-card{width:min(860px,92vw);max-height:80vh;overflow:auto;background:var(--panel);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:16px;position:relative}
+  /* Overlays (funders/common existing use z-index:60) */
+  .overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}
+  .overlay-card{width:min(96vw,1200px);max-height:88vh;overflow:auto;background:var(--panel);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:16px;position:relative}
   .overlay-close{position:absolute;top:10px;right:10px;border:none;background:transparent;color:#fff;font-size:18px;cursor:pointer}
+
+  /* New overlay stacking */
+  #panelOverlay{ z-index:110; }
+  #dexOverlay{ z-index:100; }
+  #fundersOverlay, #commonOverlay{ z-index:60; }
+
+  /* Dexscreener aspect */
+  #dexscreener-embed{ position:relative; width:100%; padding-bottom:125%; }
+  @media(min-width:1400px){ #dexscreener-embed{ padding-bottom:65%; } }
+  #dexscreener-embed iframe{ position:absolute; width:100%; height:100%; top:0; left:0; border:0; }
 
   /* Footer: fade inside footer only */
   footer{
@@ -171,7 +186,6 @@
   .progress{ width:100%; height:10px; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.12); border-radius:999px; overflow:hidden; margin-top:10px; }
   .progress > div{ height:100%; width:0%; background:linear-gradient(90deg, var(--abs-green), #32d896); transition:width .35s ease; }
   #bootRetry{ display:none; margin-top:10px; }
-   
 </style>
 </head>
 <body>
@@ -218,7 +232,7 @@
 
         <table id="gainers" class="mono">
           <thead>
-            <tr><th>#</th><th>Token</th><th>24h %</th><th>24h Vol</th><th>Mkt Cap</th></tr>
+            <tr><th>#</th><th>Token</th><th>24h %</th><th>24h Vol</th><th>Mkt Cap</th><th>Chart</th></tr>
           </thead>
           <tbody id="top5"></tbody>
         </table>
@@ -230,12 +244,13 @@
       </div>
     </section>
 
-    <!-- FULL‑WIDTH PANEL A+B -->
+    <!-- FULL-WIDTH PANEL A+B -->
     <section class="wrap below">
       <div class="panel">
         <div class="below-grid">
           <!-- A -->
           <div class="box" id="boxLeft">
+            <button class="expand-btn" id="expandA" title="Expand">+</button>
             <h3 class="mono" id="aTitle">Token Allocation &amp; Stats <small class="muted mono" id="aSnapshot" style="font-weight:400;margin-left:6px"></small></h3>
             <div id="aTokenStats"></div>
             <div id="bubble-canvas"></div>
@@ -244,6 +259,7 @@
 
           <!-- B -->
           <div class="box" id="boxRight">
+            <button class="expand-btn" id="expandB" title="Expand">+</button>
             <h3 class="mono">Wallets • First 25 vs Top 25</h3>
             <div id="statusGrid" class="status-grid"></div>
             <div class="controls-left" style="margin-bottom:8px">
@@ -300,28 +316,39 @@
     </div>
   </div>
 
-<!-- Boot overlay with progress -->
-<div class="overlay" id="bootOverlay">
-  <div class="overlay-card">
-    
-    <!-- Vision Board button (TOP) -->
-    <a id="visionBtn" class="btn mono" href="/vision.html" target="_blank" rel="noopener noreferrer">
-      Check out our Vision Board
-    </a>
-
-    <h4 class="mono">Loading latest snapshot…</h4>
-
-    <div class="banner mono">
-      <span class="spinner"></span>
-      <span id="bootStatus">Starting…</span>
+  <!-- NEW: Panel fullscreen overlay (for A or B) -->
+  <div class="overlay" id="panelOverlay">
+    <div class="overlay-card">
+      <button id="closePanelOverlay" class="overlay-close">✕</button>
+      <div id="panelOverlaySlot"></div>
     </div>
-
-    <div class="progress"><div id="bootBar"></div></div>
-
-    <button id="bootRetry" class="btn mono">Retry</button>
   </div>
-</div>
 
+  <!-- NEW: Dexscreener chart overlay -->
+  <div class="overlay" id="dexOverlay">
+    <div class="overlay-card">
+      <button id="closeDexOverlay" class="overlay-close">✕</button>
+      <div id="dexscreener-embed">
+        <iframe id="dexIframe" src="" allowfullscreen></iframe>
+      </div>
+    </div>
+  </div>
+
+  <!-- Boot overlay with progress -->
+  <div class="overlay" id="bootOverlay">
+    <div class="overlay-card">
+      <a id="visionBtn" class="btn mono" href="/vision.html" target="_blank" rel="noopener noreferrer">
+        Check out our Vision Board
+      </a>
+      <h4 class="mono">Loading latest snapshot…</h4>
+      <div class="banner mono">
+        <span class="spinner"></span>
+        <span id="bootStatus">Starting…</span>
+      </div>
+      <div class="progress"><div id="bootBar"></div></div>
+      <button id="bootRetry" class="btn mono">Retry</button>
+    </div>
+  </div>
 
   <footer>
     <div class="wrap mono">
@@ -350,39 +377,64 @@
   const iconCache = {};
   async function getTokenIcon(addr){
     if(!addr) return null;
-    const a=addr.toLowerCase(); if(iconCache[a]) return iconCache[a];
+    const a = addr.toLowerCase();
+    if (iconCache[a]) return iconCache[a];
     try{
-      const res=await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${a}`);
-      const data=await res.json();
-      if(Array.isArray(data)&&data[0]?.info?.imageUrl){ iconCache[a]=data[0].info.imageUrl; return iconCache[a]; }
-    }catch(e){ console.error("Icon fetch error",a,e); }
+      const res = await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${a}`);
+      const data = await res.json();
+      if (Array.isArray(data) && data[0]?.info?.imageUrl){
+        iconCache[a] = data[0].info.imageUrl;
+        return iconCache[a];
+      }
+    }catch(e){ console.error("Icon fetch error", a, e); }
     return null;
   }
-  const fmtUSD=(n)=> (n==null||isNaN(n)) ? '$0' : '$'+Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(n);
-  const td=(v,cls='')=>`<td class="${cls}">${v}</td>`;
-  const chg=(x)=>`<span class="${(x??0)>=0?'chg-pos':'chg-neg'}">${(x??0).toFixed(2)}%</span>`;
-  const isCA=(s)=>/^0x[a-fA-F0-9]{40}$/.test((s||'').trim());
+  const fmtUSD = (n)=> (n==null || isNaN(n)) ? '$0' :
+    '$' + Intl.NumberFormat('en-US', { notation:'compact', maximumFractionDigits:2 }).format(n);
+  const td  = (v,cls='') => `<td class="${cls}">${v}</td>`;
+  const chg = (x) => `<span class="${(x??0)>=0?'chg-pos':'chg-neg'}">${(x??0).toFixed(2)}%</span>`;
+  const isCA = (s) => /^0x[a-fA-F0-9]{40}$/.test((s||'').trim());
 
-  /* render rows */
-  async function mkRow(i,r){
+  /* render rows (+ chart btn) */
+  async function mkRow(i, r){
     const icon = await getTokenIcon(r.baseAddress);
-    const iconHtml = icon ? `<img class="tokicon tokclick" data-ca="${r.baseAddress}" src="${icon}" alt="" title="Single‑token view">` : ``;
+    const iconHtml = icon
+      ? `<img class="tokicon tokclick" data-ca="${r.baseAddress}" src="${icon}" alt="" title="Single-token view">`
+      : ``;
     const head = `<div class="rowhead"><span>#${r.rank ?? (i+1)}</span>${iconHtml}</div>`;
-    const name = r.url ? `<a href="${r.url}" target="_blank" rel="noopener">${r.name || '—'} <span class="tag">${r.symbol || ''}</span></a>`
-                     : `${r.name || '—'} <span class="tag">${r.symbol || ''}</span>`;
+    const name = r.url
+      ? `<a href="${r.url}" target="_blank" rel="noopener noreferrer">${r.name || '—'} <span class="tag">${r.symbol || ''}</span></a>`
+      : `${r.name || '—'} <span class="tag">${r.symbol || ''}</span>`;
     const capVal = (r.marketCap != null && isFinite(r.marketCap)) ? r.marketCap
                  : (r.fdv != null && isFinite(r.fdv)) ? r.fdv
                  : null;
-    return `<tr>${td(head)}${td(name)}${td(chg(r.priceChange?.h24))}${td(fmtUSD(r.volume24h))}${td(capVal!=null ? fmtUSD(capVal) : '—')}</tr>`;
+    const chartBtn = `<button class="btn smol mono info chartbtn" data-ca="${r.baseAddress}">Chart</button>`;
+    return `<tr>${td(head)}${td(name)}${td(chg(r.priceChange?.h24))}${td(fmtUSD(r.volume24h))}${td(capVal!=null ? fmtUSD(capVal) : '—')}${td(chartBtn, 'mono')}</tr>`;
   }
-  function wireTokenIconClicks(){ document.querySelectorAll('.tokclick').forEach(img=>{ img.addEventListener('click',(e)=>{ e.preventDefault(); e.stopPropagation(); startSingleFromIcon(img.dataset.ca); }); }); }
+
+  function wireTokenIconClicks(){
+    document.querySelectorAll('.tokclick').forEach(img=>{
+      img.addEventListener('click',(e)=>{
+        e.preventDefault(); e.stopPropagation();
+        startSingleFromIcon(img.dataset.ca);
+      });
+    });
+    document.querySelectorAll('.chartbtn').forEach(btn=>{
+      btn.addEventListener('click',(e)=>{
+        e.preventDefault(); e.stopPropagation();
+        openDexOverlay(btn.dataset.ca);
+      });
+    });
+  }
+
   async function renderTableRows(list){
-    const q=(document.getElementById('search').value||'').toLowerCase();
-    const rows=(list||[]).filter(r=>{
+    const q = (document.getElementById('search').value || '').toLowerCase();
+    const rows = (list||[]).filter(r=>{
       const n=(r.name||'').toLowerCase(), s=(r.symbol||'').toLowerCase();
       return !q || n.includes(q) || s.includes(q);
     });
-    const top5=rows.slice(0,5), rest10=rows.slice(5,15);
+    const top5  = rows.slice(0,5);
+    const rest10= rows.slice(5,15);
     document.getElementById('top5').innerHTML   = (await Promise.all(top5.map((r,i)=>mkRow(i,r)))).join('');
     document.getElementById('rest10').innerHTML = (await Promise.all(rest10.map((r,i)=>mkRow(i+5,r)))).join('');
     document.getElementById('expander').style.display = rows.length>5 ? '' : 'none';
@@ -392,7 +444,8 @@
   /* header tiles */
   function renderHeaderStats(b){
     if(!b) return;
-    const capVal = (typeof b.fdv === 'number' && !isNaN(b.fdv)) ? b.fdv : (typeof b.marketCap === 'number' ? b.marketCap : 0);
+    const capVal = (typeof b.fdv === 'number' && !isNaN(b.fdv)) ? b.fdv
+                 : (typeof b.marketCap === 'number' ? b.marketCap : 0);
     const fmt=(n)=>'$'+Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(n||0);
     document.getElementById('tabsCap').textContent = fmt(capVal);
     document.getElementById('tabsVol').textContent = fmt(b.vol24 || 0);
@@ -401,7 +454,9 @@
     chgEl.className = (b.chg24 ?? 0) >= 0 ? 'delta-pos mono' : 'delta-neg mono';
     document.getElementById('tabsLink').href = b.url || '#';
   }
-  function setTracked(n){ document.getElementById('trackedLine').textContent = `${(n||0).toLocaleString('en-US')} tokens tracked`; }
+  function setTracked(n){
+    document.getElementById('trackedLine').textContent = `${(n||0).toLocaleString('en-US')} tokens tracked`;
+  }
 
   /* API */
   async function latest(){ const r=await fetch('/api/snapshot/latest'); const j=await r.json(); return j.snapshot||null; }
@@ -410,17 +465,28 @@
 
   /* state */
   let snapshot=null, mode='gainers', single=false, currentCA=null;
+
   const tabGainersBtn = document.getElementById('tabGainers');
   const tabVolBtn     = document.getElementById('tabVol');
   const clearBtn      = document.getElementById('clearBtn');
   const reloadBtn     = document.getElementById('reloadBtn');
 
-  function applyMode(){ tabGainersBtn.classList.toggle('active',mode==='gainers'); tabVolBtn.classList.toggle('active',mode==='vol'); }
-  async function renderByMode(){ if(!snapshot) return; const list=mode==='gainers'?(snapshot.topGainers||[]):(snapshot.topVol||[]); await renderTableRows(list); }
+  function applyMode(){
+    tabGainersBtn.classList.toggle('active',mode==='gainers');
+    tabVolBtn.classList.toggle('active',mode==='vol');
+  }
+  async function renderByMode(){
+    if(!snapshot) return;
+    const list = mode==='gainers' ? (snapshot.topGainers||[]) : (snapshot.topVol||[]);
+    await renderTableRows(list);
+  }
 
   function enterSingleTokenMode(){
-    single=true; tabGainersBtn.style.display='none'; tabVolBtn.style.display='none';
-    clearBtn.style.display='inline-flex'; reloadBtn.style.display='inline-flex';
+    single=true;
+    tabGainersBtn.style.display='none';
+    tabVolBtn.style.display='none';
+    clearBtn.style.display='inline-flex';
+    reloadBtn.style.display='inline-flex';
   }
   function exitSingleTokenMode(){
     single=false; currentCA=null; document.getElementById('search').value='';
@@ -433,41 +499,49 @@
     enterSingleTokenMode(); currentCA=ca.toLowerCase();
     document.getElementById('expander').style.display='none';
     try{
-      const j=await addToken(currentCA);
+      const j = await addToken(currentCA);
       if(!j.ok || !j.row){
-        document.getElementById('top5').innerHTML=`<tr><td colspan="5">No data for ${currentCA}</td></tr>`;
-        document.getElementById('rest10').innerHTML='';
+        document.getElementById('top5').innerHTML = `<tr><td colspan="6">No data for ${currentCA}</td></tr>`;
+        document.getElementById('rest10').innerHTML = '';
       }else{
         setTracked(j.tokensTracked);
         document.getElementById('top5').innerHTML = await mkRow(0,j.row);
-        document.getElementById('rest10').innerHTML='';
+        document.getElementById('rest10').innerHTML = '';
       }
     }catch(e){
-      document.getElementById('top5').innerHTML=`<tr><td colspan="5">Fetch error for ${currentCA}</td></tr>`;
-      document.getElementById('rest10').innerHTML='';
+      document.getElementById('top5').innerHTML = `<tr><td colspan="6">Fetch error for ${currentCA}</td></tr>`;
+      document.getElementById('rest10').innerHTML = '';
     }
     // Kick off the deep scan (A+B) — cache-first
     window.TABS_EXT && window.TABS_EXT.startScan(currentCA);
   }
-  async function startSingleFromIcon(ca){ document.getElementById('search').value=ca; await renderSingle(ca); }
+  async function startSingleFromIcon(ca){
+    document.getElementById('search').value=ca;
+    await renderSingle(ca);
+  }
 
   async function updateHeaderForSpecialToken(){
     try{
-      const tokRes=await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${SPECIAL_CA}`);
-      const tokArr=await tokRes.json();
-      const t=Array.isArray(tokArr)&&tokArr.length?tokArr[0]:null;
+      const tokRes = await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${SPECIAL_CA}`);
+      const tokArr = await tokRes.json();
+      const t = Array.isArray(tokArr)&&tokArr.length ? tokArr[0] : null;
 
       let vol24=0;
       try{
         const pairsRes=await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${SPECIAL_CA}`);
         const pairs=await pairsRes.json();
-        if(Array.isArray(pairs)){ for(const p of pairs){ const v=Number(p?.volume?.h24||0); if(isFinite(v)) vol24+=v; } }
+        if(Array.isArray(pairs)){
+          for(const p of pairs){
+            const v=Number(p?.volume?.h24||0);
+            if(isFinite(v)) vol24+=v;
+          }
+        }
       }catch{}
 
       const fdv=Number(t?.fdv ?? null), cap=Number(t?.marketCap ?? null);
-      const capVal=Number.isFinite(fdv)?fdv:(Number.isFinite(cap)?cap:0);
-      const chg24=Number(t?.priceChange?.h24 ?? 0);
-      const link=t?.url || '#';
+      const capVal = Number.isFinite(fdv) ? fdv : (Number.isFinite(cap) ? cap : 0);
+      const chg24 = Number(t?.priceChange?.h24 ?? 0);
+      const link  = t?.url || '#';
 
       const fmt=(n)=>'$'+Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(n||0);
       document.getElementById('tabsCap').textContent = fmt(capVal);
@@ -479,6 +553,52 @@
     }catch(e){ console.warn('Header override failed:',e); }
   }
 
+  /* ---------- Panel fullscreen overlay logic ---------- */
+  const panelOverlay = document.getElementById('panelOverlay');
+  const panelSlot    = document.getElementById('panelOverlaySlot');
+  const closePanel   = document.getElementById('closePanelOverlay');
+
+  let restore = null; // function to restore original position
+
+  function openPanelOverlay(fromEl){
+    if (!fromEl || !panelOverlay || !panelSlot) return;
+    // Create placeholder to restore position
+    const ph = document.createElement('div');
+    ph.style.display = 'none';
+    fromEl.parentNode.insertBefore(ph, fromEl);
+    panelSlot.innerHTML = '';
+    panelSlot.appendChild(fromEl);
+    panelOverlay.style.display = 'flex';
+    restore = ()=>{
+      if (ph.parentNode){ ph.parentNode.insertBefore(fromEl, ph); ph.remove(); }
+      panelOverlay.style.display='none';
+      restore=null;
+    };
+  }
+  closePanel?.addEventListener('click', ()=>{ restore && restore(); });
+  panelOverlay?.addEventListener('click', (e)=>{ if(e.target===panelOverlay){ restore && restore(); } });
+
+  document.getElementById('expandA')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxLeft')));
+  document.getElementById('expandB')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxRight')));
+
+  /* ---------- Dexscreener chart overlay ---------- */
+  const dexOverlay = document.getElementById('dexOverlay');
+  const dexIframe  = document.getElementById('dexIframe');
+  const closeDex   = document.getElementById('closeDexOverlay');
+
+  function openDexOverlay(ca){
+    if(!isCA(ca)) return;
+    const src = `https://dexscreener.com/abstract/${ca}?embed=1&loadChartSettings=0&trades=0&tabs=0&info=0&chartLeftToolbar=0&chartTimeframesToolbar=0&loadChartSettings=0&chartDefaultOnMobile=1&chartTheme=dark&theme=dark&chartStyle=1&chartType=usd&interval=15`;
+    dexIframe.src = src;
+    dexOverlay.style.display = 'flex';
+  }
+  function closeDexOverlay(){
+    dexOverlay.style.display='none';
+    dexIframe.src = ''; // stop background work
+  }
+  closeDex?.addEventListener('click', closeDexOverlay);
+  dexOverlay?.addEventListener('click', (e)=>{ if(e.target===dexOverlay) closeDexOverlay(); });
+
   /* ---------- BOOT OVERLAY HELPERS ---------- */
   const bootOv = document.getElementById('bootOverlay');
   const bootSt = document.getElementById('bootStatus');
@@ -489,7 +609,11 @@
   function bootSet(msg, p){ if(bootSt) bootSt.textContent = msg; if(bootBar) bootBar.style.width = Math.max(0, Math.min(100, p||0)) + '%'; }
   function bootHide(){ if(bootOv) bootOv.style.display='none'; }
   if (bootRetryBtn){
-    bootRetryBtn.onclick = async ()=>{ bootRetryBtn.style.display='none'; bootShow('Retrying…', 10); await boot(true); };
+    bootRetryBtn.onclick = async ()=>{
+      bootRetryBtn.style.display='none';
+      bootShow('Retrying…', 10);
+      await boot(true);
+    };
   }
 
   async function boot(isRetry=false){
@@ -528,15 +652,22 @@
   }
 
   // Controls
-  tabGainersBtn.onclick=async()=>{ if(single) return; mode='gainers'; applyMode(); await renderByMode(); };
-  tabVolBtn.onclick    =async()=>{ if(single) return; mode='vol';     applyMode(); await renderByMode(); };
-  clearBtn.onclick = async ()=>{ exitSingleTokenMode(); window.TABS_EXT && window.TABS_EXT.reset(); mode='gainers'; applyMode(); await renderByMode(); document.getElementById('expander').style.display=''; };
-  reloadBtn.onclick=async()=>{ if(!currentCA) return; window.TABS_EXT && window.TABS_EXT.startScan(currentCA,{force:true}); };
-  document.getElementById('toggleExpand').onclick=()=>{
+  tabGainersBtn.onclick = async ()=>{ if(single) return; mode='gainers'; applyMode(); await renderByMode(); };
+  tabVolBtn.onclick     = async ()=>{ if(single) return; mode='vol';     applyMode(); await renderByMode(); };
+  clearBtn.onclick = async ()=>{
+    exitSingleTokenMode();
+    window.TABS_EXT && window.TABS_EXT.reset();
+    mode='gainers'; applyMode(); await renderByMode();
+    document.getElementById('expander').style.display='';
+  };
+  reloadBtn.onclick = async ()=>{ if(!currentCA) return; window.TABS_EXT && window.TABS_EXT.startScan(currentCA,{force:true}); };
+
+  document.getElementById('toggleExpand').onclick = ()=>{
     const e=document.getElementById('expander'); e.classList.toggle('open');
     document.getElementById('toggleExpand').textContent = e.classList.contains('open') ? 'Show less (−10)' : 'Show more (+10)';
   };
-  document.getElementById('refresh').onclick=async()=>{
+
+  document.getElementById('refresh').onclick = async ()=>{
     const q=(document.getElementById('search').value||'').trim();
     if(q===''){
       bootShow('Refreshing snapshot…', 15);
@@ -552,10 +683,15 @@
       if(!single) await renderByMode();
     }
   };
-  document.getElementById('search').addEventListener('input', async ()=>{ if(single) return; await renderByMode(); });
 
-  // expose for icon click handler
+  document.getElementById('search').addEventListener('input', async ()=>{
+    if(single) return;
+    await renderTableRows((mode==='gainers'?snapshot.topGainers:snapshot.topVol)||[]);
+  });
+
+  // expose
   window.TABS_APP = { boot, startSingleFromIcon };
+  window.openDexOverlay = openDexOverlay;
 })();
 document.addEventListener('DOMContentLoaded', () => {
   if (window.__ABS_BOOTED__) return; window.__ABS_BOOTED__ = true;
@@ -563,5 +699,3 @@ document.addEventListener('DOMContentLoaded', () => {
   window.TABS_APP?.boot();
 });
 </script>
-</body>
-</html>
