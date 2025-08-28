@@ -279,6 +279,65 @@ app.post('/api/token-stats/save', (req, res) => {
   res.json({ ok:true, ts });
 });
 
+
+// === Funders persistence (Option B) ===
+const FUNDERS_PATH = path.join(DATA_DIR, 'funders.json');
+function loadFunders(){
+  try { return JSON.parse(fs.readFileSync(FUNDERS_PATH,'utf8')); } catch(e){ return {}; }
+}
+function saveFunders(obj){
+  try {
+    fs.mkdirSync(path.dirname(FUNDERS_PATH), { recursive: true });
+    fs.writeFileSync(FUNDERS_PATH, JSON.stringify(obj, null, 2));
+  } catch(e){ console.error('saveFunders error', e); }
+}
+let fundersDb = loadFunders();
+
+// GET /api/funders?token=0x...
+app.get('/api/funders', (req,res)=>{
+  const token = String(req.query.token||'').toLowerCase();
+  const arr = Object.values(fundersDb).filter(x => x.tokenCA===token);
+  res.json({ ok:true, token, entries: arr });
+});
+
+// POST /api/funders/batch
+// { tokenCA, entries:[ { funder, buyer, amountInETH, amountInWETH, amountOutETH, amountOutWETH, firstTs } ] }
+app.post('/api/funders/batch', (req,res)=>{
+  try{
+    const { tokenCA, entries } = req.body || {};
+    if (!tokenCA || !Array.isArray(entries)) return res.status(400).json({ ok:false, error:'Bad payload' });
+    const tca = String(tokenCA).toLowerCase();
+    for (const e of entries){
+      const funder = String(e.funder||'').toLowerCase();
+      if (!funder) continue;
+      const key = tca + '::' + funder;
+      const cur = fundersDb[key] || { tokenCA: tca, funder, buyers: 0, amountInETH: 0, amountInWETH:0, amountOutETH:0, amountOutWETH:0, firstTs: e.firstTs||0, lastTs: e.firstTs||0, buyersSet: {} };
+      cur.buyers += 1;
+      cur.amountInETH += Number(e.amountInETH||0);
+      cur.amountInWETH += Number(e.amountInWETH||0);
+      cur.amountOutETH += Number(e.amountOutETH||0);
+      cur.amountOutWETH += Number(e.amountOutWETH||0);
+      if (e.buyer){ cur.buyersSet[String(e.buyer).toLowerCase()] = true; }
+      if (e.firstTs && (!cur.firstTs || e.firstTs < cur.firstTs)) cur.firstTs = e.firstTs;
+      if (e.firstTs && e.firstTs > cur.lastTs) cur.lastTs = e.firstTs;
+      fundersDb[key] = cur;
+    }
+    // strip buyersSet for storage size
+    const plain = {};
+    for (const [k,v] of Object.entries(fundersDb)){
+      plain[k] = { ...v, buyers: Object.keys(v.buyersSet||{}).length };
+      delete plain[k].buyersSet;
+    }
+    saveFunders(plain);
+    fundersDb = plain;
+    res.json({ ok:true, saved: entries.length });
+  }catch(err){
+    console.error('funders/batch error', err);
+    res.status(500).json({ ok:false, error: String(err && err.message || err) });
+  }
+});
+
+
 // ---------- Static ----------
 app.use(express.static(PUBLIC_DIR, {
   extensions: ['html'],
