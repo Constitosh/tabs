@@ -549,7 +549,17 @@
       <div class="statrow mono"><b>Top 10 holders</b><span>${(A.top10Pct||0).toFixed(4)}%</span></div>
       <div class="statrow mono"><b>Creator</b><span>${A.creatorAddress ? `<a href="${EXPLORER}/address/${A.creatorAddress}" target="_blank" rel="noopener">${shortAddr(A.creatorAddress)}</a> <span class="muted">(${(A.creatorPct||0).toFixed(4)}%)</span>` : 'n/a'}</span></div>
     `;
-    renderBubble({ root:aBubble(), holders:(A.holdersForBubbles||[]), extras:(A.lpNodes||[]) });
+    
+    // Build a quick progress map for tooltips from B.top25
+    const __pmap = new Map();
+    (B.top25||[]).forEach(h=>{ try{ __pmap.set((h.address||'').toLowerCase(), { totalIn:h.totalIn||0, holdings:h.holdings||0 }); }catch{} });
+    window.__progressMap = __pmap;
+renderBubble({ root:aBubble(), holders:(A.holdersForBubbles||[]), extras:(A.lpNodes||[]) });
+    try{
+      const holdersForStats = (A.holdersForBubbles||[]).map(h=>({ address:h.address, balancePct:h.pct }));
+      const ev = new CustomEvent('tabs:singleTokenLoaded', { detail: { token:null, holders: holdersForStats, txs: [] } });
+      window.dispatchEvent(ev); // TABS_EXT_DISPATCH
+    }catch(e){ console.warn('dispatch error', e); }
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
     // Container B
