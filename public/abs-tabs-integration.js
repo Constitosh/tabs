@@ -1,8 +1,11 @@
-/* abs-tabs-integration.js — unified A+B integration (v7, bubble-map fixes)
-   - Balance-based denominator for all % calcs (holders + LP)
-   - Fixed renderBubbleGraph undefined refs; LPs are laid out from provided nodes only
-   - Biggest-centered, non-overlapping holder bubbles; LP column on the right
-   - First 25 vs Top 25 + status grid; funding overlay (ETH + WETH) preserved
+/* abs-tabs-integration.js — unified A+B integration (v4)
+   - Cache-first deep scan via /api/token-stats (GET) with timestamp
+   - Fresh scan saver via /api/token-stats/save (POST)
+   - Container A: stats + D3 bubble map + snapshot ts
+   - Container B: First 25 vs Top 25 + status grid + row->funders overlay
+   - Funding wallets overlay (ETH + WETH inbound before first receipt)
+   - Hidden "common funders" button (kept in code, not shown)
+   - 5-min holders polling for SPECIAL_HOLDERS_CA updates header tile
 */
 (function (global) {
   const TABS = {};
@@ -13,32 +16,25 @@
   const ETHERSCAN_API = 'H13F5VZ64YYK4M21QMPEW78SIKJS85UTWT'; // user-provided
   const EXPLORER = 'https://abscan.org';
   const MIN_INTERVAL_MS = 250;
-  const SOLD_ALL_SMALL_HOLD = 2000;
+  const SOLD_ALL_SMALL_HOLD = 2000;  // heuristic
   const IGNORE_FUNDER_OVER_USD = 1_000_000;
   const TOP_FUNDER_LIMIT = 5;
   const TOP_COMMON_LIMIT = 5;
   const SPECIAL_HOLDERS_CA = '0x8c3d850313eb9621605cd6a1acb2830962426f67';
 
-  // Known proxies / routers
-  const KNOWN_PROXIES = new Set([
-    '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f',
-    '0x20bf96ad879ba4d6904595ed05bc8d0ce226b99a',
-    '0xcca5047e4c9f9d72f11c199b4ff1960f88a4748d'
-  ]);
-
-  // Proxy tuning
-  const PROXY_MIN_DISTINCT_RECIPIENTS = 3;
-  const PROXY_OUTFLOW_SHARE_NUM = 90n;
-  const PROXY_OUTFLOW_SHARE_DEN = 100n;
-  const CROSS_TX_WINDOW_SEC = 600;
-
   // ======== DOM ========
   const $ = (s) => document.querySelector(s);
+
+  // Status line (center)
   const scanStatusEl = () => $('#scanStatus');
+
+  // Container A
   const aSnap = () => $('#aSnapshot');
   const aStats = () => $('#aTokenStats');
   const aBubble = () => $('#bubble-canvas');
   const aBubbleNote = () => $('#a-bubble-note');
+
+  // Container B
   const bStatusGrid = () => $('#statusGrid');
   const firstBtn = () => $('#btnFirst25');
   const topBtn = () => $('#btnTop25');
@@ -52,6 +48,8 @@
   const buyersPanel = () => $('#buyersPanelB');
   const holdersExpander = () => $('#holdersExpander');
   const holdersToggle = () => $('#holdersToggle');
+
+  // Overlays + header tile
   const fundersOverlay = () => $('#fundersOverlay');
   const fundersInner = () => $('#fundersInner');
   const commonOverlay = () => $('#commonOverlay');
@@ -85,7 +83,7 @@
     if (denBI === 0n) return 0;
     const SCALE = 1_000_000n;
     const q = (numBI * SCALE) / denBI;
-    return Number(q) / 10_000; // => %
+    return Number(q) / 10_000;
   }
   function topicToAddress(topic){ return '0x' + topic.slice(26).toLowerCase(); }
   function isCA(s){ return /^0x[0-9a-fA-F]{40}$/.test((s || '').trim()); }
@@ -131,42 +129,6 @@
   }
 
   // ======== Dexscreener helpers ========
-  async function getPairAddresses(contract){
-    const out = new Set();
-    try{
-      const pr = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
-      const pd = await pr.json();
-      if (Array.isArray(pd)){
-        for (const p of pd){
-          let pa = String(p?.pairAddress||'').toLowerCase(); if (!pa) continue;
-          if (pa.includes(':')) pa = pa.split(':')[0];
-          if (/^0x[a-f0-9]{40}$/.test(pa)) out.add(pa);
-        }
-      }
-    }catch{}
-    return Array.from(out);
-  }
-  async function getLPBaseAllocation(contract){
-    const result = { baseSum: 0, perPair: new Map() };
-    try{
-      const r = await fetch(`https://api.dexscreener.com/tokens/v1/abstract/${contract}`);
-      if (!r.ok) return result;
-      const arr = await r.json();
-      const flat = Array.isArray(arr) ? arr : [];
-      for (const t of flat){
-        const ps = Array.isArray(t?.pairs) ? t.pairs : (Array.isArray(t?.markets) ? t.markets : []);
-        for (const p of (ps||[])){
-          const base = Number(p?.liquidity?.base || 0);
-          const pa = String(p?.pairAddress || '').toLowerCase();
-          if (base > 0){
-            result.baseSum += base;
-            if (pa) result.perPair.set(pa, (result.perPair.get(pa)||0) + base);
-          }
-        }
-      }
-    }catch{}
-    return result;
-  }
   async function priceUsdForToken(contract){
     try{
       const res = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
@@ -199,6 +161,50 @@
     return { totalUsd: total };
   }
 
+  // ======== Bubble map (D3) ========
+  function renderBubble({ root, holders, extras }){
+    root.innerHTML='';
+    const width = root.clientWidth || 960;
+    const height = Math.max(600, Math.round(width * 0.45));
+    const data = (holders||[]).concat(extras || []);
+    const svg = d3.select(root).append('svg').attr('width', width).attr('height', height);
+    const pack = d3.pack().size([width,height]).padding(3);
+    const droot = d3.hierarchy({ children:data }).sum(d=>Math.max(0.000001, d.balance||0));
+    const nodes = pack(droot).leaves();
+
+    let tip = d3.select('#bubble-tip');
+    if (tip.empty()){
+      tip = d3.select('body').append('div').attr('id','bubble-tip')
+        .style('position','fixed').style('background','#111').style('color','#fff')
+        .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
+        .style('pointer-events','none').style('opacity',0).style('z-index',9999)
+        .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
+    }
+    const fillFor = (d)=> d.data.__type==='lp' ? '#8B5CF6' : '#375a4e';
+
+    const g = svg.selectAll('g').data(nodes).enter().append('g').attr('transform',d=>`translate(${d.x},${d.y})`);
+    g.append('circle')
+      .attr('r', d=>d.r).attr('fill', fillFor)
+      .attr('stroke', d=> d.data.__type==='lp' ? '#C4B5FD' : null)
+      .attr('stroke-width', d=> d.data.__type==='lp' ? 2.5 : null)
+      .on('mouseover', (e,d)=>{
+        const pct=(d.data.pct||0).toFixed(4);
+        tip.html(d.data.__type==='lp'
+          ? `<div><strong>LP</strong> — <span class="mono">${pct}%</span> of supply</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
+          : `<div><strong><span class="mono">${pct}%</span> of supply</strong></div><div>${d.data.address.slice(0,6)}…${d.data.address.slice(-4)}</div><div style="opacity:.8;margin-top:6px">Click to open in ABScan ↗</div>`
+        ).style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px').style('opacity',1);
+      })
+      .on('mousemove', (e)=> d3.select('#bubble-tip').style('left',(e.clientX+12)+'px').style('top',(e.clientY+12)+'px'))
+      .on('mouseout', ()=> d3.select('#bubble-tip').style('opacity',0))
+      .on('click', (e,d)=> window.open(`${EXPLORER}/address/${d.data.address}`,'_blank'));
+
+    g.append('text')
+      .attr('dy','.35em').style('text-anchor','middle')
+      .style('font-size', d=> Math.min(d.r*0.45, 16)).style('fill','#fff')
+      .style('pointer-events','none').classed('mono', true)
+      .text(d=> d.data.__type==='lp' ? 'LP' : `${(d.data.pct||0).toFixed(2)}%`);
+  }
+
   // ======== Persistence API (server) ========
   async function loadCachedScan(ca){
     try{
@@ -229,7 +235,7 @@
       if (seen.has(to)) continue;
       out.push({ address:to, timeStamp:Number(l.timeStamp||l.blockTimestamp||0), txHash:l.transactionHash, firstInAmount:0 });
       seen.add(to);
-      if (out.length>=27) break; // first 2 are usually LP/mint
+      if (out.length>=27) break; // we will drop the first two (likely LP/mints)
     }
     return out.slice(2);
   }
@@ -251,7 +257,7 @@
     return { ...rec, firstInAmount:firstIn, timeStamp: earliestTs!==Infinity ? earliestTs : rec.timeStamp, totalIn, totalOut, holdings:h, status, sClass };
   }
 
-  // ======== Funding discovery ========
+  // ======== Funding discovery & overlays ========
   async function getFundingWallets(addr, cutoffTs){
     const [nativeTxs, erc20Txs] = await Promise.all([
       apiTxlist(addr).catch(()=>[]),
@@ -277,502 +283,6 @@
     return { addrs:Array.from(merged.keys()), info:merged };
   }
 
-  // ======== Fresh scan ========
-  async function doFreshScan(contract){
-    const result = { meta:{ contract }, a:{}, b:{} };
-
-    setScanStatus('Downloading token transfer history…');
-    const txs = await fetchAllTokenTx(contract);
-    if (!txs.length) throw new Error('No transactions found for this token.');
-    const tokenDecimals = chooseDecimals(txs);
-
-    setScanStatus('Resolving creator & supply metrics…');
-    let creatorAddress = '';
-    try{
-      const cRes = await fetch(`${BASE_URL}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${ETHERSCAN_API}`);
-      const cData = await cRes.json();
-      creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator) ? cData.result[0].contractCreator.toLowerCase() : '';
-    }catch{}
-
-    const ZERO='0x0000000000000000000000000000000000000000';
-    const DEAD='0x000000000000000000000000000000000000dead';
-    const burnSet = new Set([ZERO,DEAD]);
-
-    const balances = {}; // address -> bigint
-    let mintedUnits=0n, burnedUnits=0n;
-
-    const firstInMap = new Map(); // holder -> { ts, v, from }
-    const outTxBySender = new Map(); // sender -> [{to,ts,v}]
-    const inAmtBySender  = new Map(); // sender -> bigint (inbound value)
-    const outAmtBySender = new Map(); // sender -> bigint (outbound value)
-
-    for (const t of txs){
-      const from=(t.from||t.fromAddress||'').toLowerCase();
-      const to  =(t.to||t.toAddress||'').toLowerCase();
-      const vBI = toBI(t.value||'0');
-      const ts  = Number(t.timeStamp)||0;
-
-      if (from===ZERO) mintedUnits += vBI;
-      if (burnSet.has(to)) burnedUnits += vBI;
-
-      if (from===contract || to===contract) continue;
-
-      if (!burnSet.has(from)) balances[from] = (balances[from]||0n) - vBI;
-      if (!burnSet.has(to))   balances[to]   = (balances[to]  ||0n) + vBI;
-
-      if (!firstInMap.has(to) && !burnSet.has(to)) firstInMap.set(to, { ts, v:vBI, from });
-
-      if (!burnSet.has(from)){
-        const arr = outTxBySender.get(from) || [];
-        arr.push({ to, ts, v:vBI });
-        outTxBySender.set(from, arr);
-        outAmtBySender.set(from, (outAmtBySender.get(from)||0n) + vBI);
-      }
-      if (!burnSet.has(to)){
-        inAmtBySender.set(to, (inAmtBySender.get(to)||0n) + vBI);
-      }
-    }
-
-    // ===== Supply denominator (units) =====
-    // Use on-chain positive balances for ALL percentage math (holders + LP).
-    const denomUnits = Object.values(balances).reduce((s,v)=> s + (v>0n ? v : 0n), 0n);
-    const currentSupplyUnits = denomUnits; // display and math aligned
-
-    // LP addresses & allocation
-    setScanStatus('Fetching LP pairs & allocation…');
-    const pairAddresses = await getPairAddresses(contract);
-    const pairSet = new Set(pairAddresses);
-    const lpAlloc  = await getLPBaseAllocation(contract);
-
-    // Holders (exclude ZERO/DEAD); proxies excluded later where needed
-    setScanStatus('Building holders set…');
-    let holdersAll = Object.entries(balances)
-      .filter(([addr,bal])=> bal>0n && !burnSet.has(addr))
-      .map(([address,units])=>({ address, units }));
-    holdersAll.sort((a,b)=> (b.units>a.units)?1:(b.units<a.units)?-1:0);
-
-    // Proxy heuristics
-    function isFanoutRouter(sender){
-      const arr = (outTxBySender.get(sender)||[]).slice().sort((a,b)=>a.ts-b.ts);
-      let i=0, best=0;
-      while(i<arr.length){
-        const start = arr[i].ts, seen = new Set([arr[i].to]);
-        let j=i+1;
-        while(j<arr.length && (arr[j].ts - start) <= CROSS_TX_WINDOW_SEC){ seen.add(arr[j].to); j++; }
-        best = Math.max(best, seen.size);
-        i++;
-        if (best >= PROXY_MIN_DISTINCT_RECIPIENTS) return true;
-      }
-      return best >= PROXY_MIN_DISTINCT_RECIPIENTS;
-    }
-    function hasHighOutflow(sender){
-      const out = outAmtBySender.get(sender)||0n;
-      const inn = inAmtBySender.get(sender)||0n;
-      const tot = out + inn;
-      if (tot===0n) return false;
-      return (out * PROXY_OUTFLOW_SHARE_DEN) >= (PROXY_OUTFLOW_SHARE_NUM * tot);
-    }
-
-    const proxySet = new Set([...KNOWN_PROXIES].map(a=>String(a).toLowerCase()));
-    for (const sender of outTxBySender.keys()){
-      if (isFanoutRouter(sender) || hasHighOutflow(sender)) proxySet.add(sender);
-    }
-
-    // First sender for each holder
-    const holderFirstSender = new Map();
-    for (const h of holdersAll){
-      const rec = firstInMap.get(h.address);
-      if (rec && rec.from) holderFirstSender.set(h.address.toLowerCase(), String(rec.from).toLowerCase());
-    }
-
-    // Group IDs
-    const bySenderRecipients = new Map();
-    for (const [holder, sender] of holderFirstSender.entries()){
-      const m = bySenderRecipients.get(sender) || new Set();
-      m.add(holder);
-      bySenderRecipients.set(sender, m);
-    }
-    const sharedFunderSet = new Set();
-    for (const [sender, set] of bySenderRecipients.entries()){
-      if (proxySet.has(sender)) continue;
-      if (set.size >= 2) sharedFunderSet.add(sender);
-    }
-
-    // Holders for bubble map (exclude pure proxy addresses as holders)
- 
-    const holdersForBubblesRaw = holdersAll
-      .filter(h => !proxySet.has(String(h.address).toLowerCase()))
-      .map(h => {
-        const pct = currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0;
-        return { address:h.address, units:h.units, balance:Number(h.units)/(10**tokenDecimals), pct };
-      })
-      .filter(h => (h.pct||0) >= 0.01)
-      .slice(0, 500);
-
-    // LP nodes from Dexscreener 'liquidity.base' (fallback: on-chain)
-    const lpNodes=[];
-    for (const pa of pairAddresses){
-      let base = lpAlloc.perPair.get(pa) || 0;
-      if (!(base>0)){
-        const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
-        base = Number(units)/(10**tokenDecimals);
-      }
-      // Convert base (token amount) -> percentage of currentSupplyUnits
-      const baseUnitsApprox = BigInt(Math.round(base * (10**tokenDecimals)));
-      const lpPct = currentSupplyUnits>0n ? pctUnits(baseUnitsApprox, currentSupplyUnits) : 0;
-      if (lpPct>0) lpNodes.push({ address:pa, balance:base, pct: lpPct, __type:'lp' });
-      await sleep(20);
-    }
-
-    // Stats for header
-    const top10Pct  = holdersForBubblesRaw.slice(0,10).reduce((s,h)=>s+(h.pct||0),0);
-    const creatorPct= (()=>{
-      const c = creatorAddress ? holdersForBubblesRaw.find(h=>h.address.toLowerCase()===creatorAddress) : null;
-      return c ? (c.pct||0) : 0;
-    })();
-
-    // Maps for UI tagging
-    const proxyMap = {};       // holder -> proxyId
-    const connectedMap = {};   // holder -> sharedFunderId
-    for (const h of holdersForBubblesRaw){
-      const hl = h.address.toLowerCase();
-      const s  = holderFirstSender.get(hl);
-      if (!s) continue;
-      if (proxySet.has(s))      proxyMap[hl] = s;
-      else if (sharedFunderSet.has(s)) connectedMap[hl] = s;
-    }
-
-    // A (stats)
-    result.a = {
-      contract,
-      tokenDecimals,
-      minted: Number(mintedUnits)/(10**tokenDecimals),
-      burned: Number(burnedUnits)/(10**tokenDecimals),
-      currentSupply: Number(currentSupplyUnits)/(10**tokenDecimals), // display == denominator
-      currentSupplyUnits: String(currentSupplyUnits),
-      totalHolders: holdersAll.length,
-      top10Pct,
-      creatorAddress,
-      creatorPct,
-      holdersForBubbles: holdersForBubblesRaw.map(h => ({ address:h.address, balance:h.balance, pct:h.pct })),
-      lpNodes,
-      proxyMap,
-      connectedMap
-    };
-
-    // ===== B (tables) — proxies excluded
-    setScanStatus('Preparing tables…');
-
-    // First 25 unique recipients from logs (order preserved), excluding proxy/LP/burn
-    const rawFirsts = await getFirst27Receivers(contract);
-    const first25 = rawFirsts
-      .filter(r=>{
-        const a=r.address.toLowerCase();
-        return !proxySet.has(a) && !pairSet.has(a) && a!=='0x0000000000000000000000000000000000000000' && a!=='0x000000000000000000000000000000000000dead';
-      })
-      .slice(0,25);
-
-    // Enrich first-25 rows for UI
-    const enriched=[];
-    setScanStatus('Computing totals & statuses per wallet…');
-    for (const r of first25){
-      const st = await enrichReceiverStats(contract, r).catch(()=>null);
-      if (st) enriched.push(st);
-      await sleep(25);
-    }
-
-    // Top 25 holders (proxies excluded)
-    const top25 = holdersAll
-      .filter(h => !proxySet.has(String(h.address).toLowerCase()))
-      .slice(0,25)
-      .map((h,i)=>{
-        const first = firstInMap.get(h.address) || { ts:0, v:0n };
-        return {
-          rank: i+1,
-          address: h.address,
-          firstIn: Number(first.v)/(10**tokenDecimals),
-          holdings: Number(h.units)/(10**tokenDecimals),
-          pct: currentSupplyUnits>0n ? pctUnits(h.units, currentSupplyUnits) : 0
-        };
-      });
-
-    result.b = { first25: enriched, top25 };
-    return result;
-  }
-
-  function buildGraphFromScan(A, B){
-    const holderNodes = (A.holdersForBubbles || []).map(h => ({
-      address: h.address,
-      balance: Number(h.balance || 0),
-      pct: Number(h.pct || 0),
-      tags: [],
-      label: null,
-      proxyId: null,       // via proxy groups (stroke color)
-      connectId: null,     // shared funder groups (fill color)
-      peakTokens: Number(h.balance || 0),
-      leftTokens: Number(h.balance || 0),
-      leftPct: 100
-    }));
-
-    const byAddr = new Map(holderNodes.map(n => [String(n.address).toLowerCase(), n]));
-
-    // LP nodes (already computed in A.lpNodes)
-    for (const lp of (A.lpNodes || [])){
-      const key = String(lp.address||'').toLowerCase();
-      if (!byAddr.has(key)){
-        byAddr.set(key, { address:key, balance:Number(lp.balance||0), pct:Number(lp.pct||0), tags:['lp'], label:'LP', peakTokens:Number(lp.balance||0), leftTokens:Number(lp.balance||0), leftPct:100 });
-      }else{
-        const n = byAddr.get(key);
-        if (!n.tags.includes('lp')) n.tags.push('lp');
-        if (!n.label) n.label = 'LP';
-        n.pct = Number(lp.pct || n.pct || 0);
-        n.balance = Number(lp.balance || n.balance || 0);
-      }
-    }
-
-    // Creator tag
-    if (A.creatorAddress){
-      const key = String(A.creatorAddress).toLowerCase();
-      const n = byAddr.get(key);
-      if (n){ if (!n.tags.includes('creator')) n.tags.push('creator'); }
-    }
-
-    // Tag via-proxy vs shared-funder
-    for (const [holderLower, proxyLower] of Object.entries(A.proxyMap || {})){
-      const n = byAddr.get(holderLower); if (!n) continue;
-      n.proxyId = String(proxyLower);
-      if (!n.tags.includes('via-proxy')) n.tags.push('via-proxy');
-    }
-    for (const [holderLower, funderLower] of Object.entries(A.connectedMap || {})){
-      const n = byAddr.get(holderLower); if (!n) continue;
-      n.connectId = String(funderLower);
-      if (!n.tags.includes('connected')) n.tags.push('connected');
-    }
-
-    // Peak/Left from B tables
-    const first25By = new Map((B.first25||[]).map(r => [String(r.address).toLowerCase(), r]));
-    const top25By   = new Map((B.top25||[]).map(r => [String(r.address).toLowerCase(), r]));
-    for (const [k,n] of byAddr.entries()){
-      const r = first25By.get(k) || top25By.get(k);
-      if (r){
-        const totIn = Number(r.totalIn || r.firstIn || 0);
-        const cur   = Number(r.holdings || n.balance || 0);
-        const peak  = Math.max(totIn, cur);
-        n.peakTokens = peak;
-        n.leftTokens = cur;
-        n.leftPct    = peak>0 ? (cur/peak)*100 : 0;
-      }
-    }
-
-    return { explorer: EXPLORER, nodes: Array.from(byAddr.values()) };
-  }
-
-  function renderBubbleGraph(rootEl, graph){
-    try {
-      const EX = graph.explorer || 'https://abscan.org';
-      const allNodes = Array.isArray(graph.nodes) ? graph.nodes : [];
-      const holders = allNodes.filter(n => !(n.tags||[]).includes('lp'));
-      const lps     = allNodes.filter(n =>  (n.tags||[]).includes('lp'));
-
-      // normalize numbers
-      holders.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
-      lps.forEach(n => { n.pct = +n.pct || 0; n.balance = +n.balance || 0; });
-
-      // cap tiny rounding so holder % total ≤ 100
-      const pctSum = holders.reduce((s,n)=>s+n.pct,0);
-      if (pctSum > 100.0001) {
-        const k = 100 / pctSum;
-        holders.forEach(n => n.pct *= k);
-      }
-
-      rootEl.innerHTML = '';
-      const width  = rootEl.clientWidth || 960;
-      const height = Math.max(560, Math.round(width * 0.56));
-
-      const svg   = d3.select(rootEl).append('svg')
-        .attr('width', width)
-        .attr('height', height)
-        .style('cursor','grab');
-      const rootG = svg.append('g');
-
-      // colors
-      const FILL_HOLDER = '#375a4e';
-      const FILL_CONN   = '#0ea5a8';   // shared funder group
-      const FILL_CREATOR= '#f59e0b';   // creator bubble
-      const STROKE_DEF  = 'rgba(0,0,0,.35)';
-
-      // per-proxy stroke palette
-      const proxyIds = Array.from(new Set(holders.filter(n=>n.proxyId).map(n=>String(n.proxyId))));
-      const proxyColor = d3.scaleOrdinal()
-        .domain(proxyIds)
-        .range([
-          '#f59e0b','#60a5fa','#ef4444','#10b981','#a78bfa',
-          '#f472b6','#22d3ee','#f43f5e','#34d399','#eab308',
-          '#38bdf8','#fb7185','#84cc16','#c084fc'
-        ]);
-
-      // radius scale
-      const maxPct = Math.max(0.0001, ...holders.map(n => n.pct), ...lps.map(n => n.pct));
-      const rScale = d3.scaleSqrt().domain([0, maxPct]).range([8, 56]);
-      holders.forEach(n => n.r = rScale(n.pct));
-      lps.forEach(n => n.r = rScale(n.pct));
-
-      // use pack to seed positions (bigger center)
-      const pack = d3.pack().size([width, height]).padding(3);
-      const root = d3.hierarchy({ children: holders }).sum(d => d.balance);
-      const seedLeaves = pack(root).leaves();
-      holders.forEach(h=>{
-        const n = seedLeaves.find(x => x.data.address === h.address);
-        if (n){ h.x = n.x; h.y = n.y; h.r = n.r; }
-      });
-
-      // settle to center without overlaps
-      const cx = width * 0.40, cy = height * 0.5;
-      const maxR = Math.max(...holders.map(n => n.r||1), 1);
-      const sizeNorm = (node) => Math.max(0, Math.min(1, (node.r||1)/maxR));
-      const centerStrength = (node) => 0.03 + 0.22 * Math.pow(sizeNorm(node), 1.25);
-
-      const sim = d3.forceSimulation(holders)
-        .alpha(1)
-        .velocityDecay(0.25)
-        .force('collide', d3.forceCollide(node => (node.r||8) + 3).strength(1))
-        .force('x', d3.forceX(cx).strength(node => centerStrength(node)))
-        .force('y', d3.forceY(cy).strength(node => centerStrength(node)))
-        .stop();
-      for (let i=0;i<160;i++) sim.tick();
-
-      // lay out LPs as a right-side column
-      const HBOX = {
-        x: d3.min(holders, n=>n.x - n.r), y: d3.min(holders, n=>n.y - n.r),
-        x2: d3.max(holders, n=>n.x + n.r), y2: d3.max(holders, n=>n.y + n.r)
-      };
-      const lpGap = 22;
-      const lpAreaX = HBOX.x2 + lpGap + (width*0.05);
-      let lpY = HBOX.y + 20;
-      lps.forEach(node => { node.x = lpAreaX + node.r; node.y = lpY + node.r; lpY += node.r*2 + 22; });
-
-      // zoom
-      const zoom = d3.zoom().scaleExtent([0.6, 7]).on('zoom', (ev) => rootG.attr('transform', ev.transform));
-      svg.call(zoom);
-
-      // draw: holders + LPs
-      const ALL = holders.concat(lps);
-      const nodeSel = rootG.selectAll('g.node').data(ALL, node => node.address).join(enter => {
-        const g = enter.append('g').attr('class','node')
-          .attr('transform', node => `translate(${node.x},${node.y})`)
-          .style('cursor','pointer');
-
-        // helpers
-        const isLP       = node => (node.tags||[]).includes('lp');
-        const isCreator  = node => (node.tags||[]).includes('creator');
-        const isConn     = node => !!node.connectId;
-
-        g.append('circle')
-          .attr('r', node => Math.max(8, node.r || 8))
-          .attr('fill', node => isLP(node) ? '#8b5cf6' : (isCreator(node) ? FILL_CREATOR : (isConn(node) ? FILL_CONN : FILL_HOLDER)))
-          .attr('fill-opacity', 0.95)
-          .attr('stroke', node =>
-            isLP(node) ? '#c4b5fd' :
-            (node.proxyId ? proxyColor(String(node.proxyId)) : STROKE_DEF)
-          )
-          .attr('stroke-width', node => isLP(node) ? 2.5 : (node.proxyId ? 3 : 1.2));
-
-        // % label
-        g.append('text')
-          .text(node => isLP(node) ? 'LP' : `${(+node.pct || 0).toFixed(2)}%`)
-          .attr('text-anchor','middle')
-          .attr('dy','0.32em')
-          .attr('pointer-events','none')
-          .attr('fill','rgba(255,255,255,.88)')
-          .attr('font-size', node => {
-            const maxFs = Math.max(8, (node.r||12) * 0.48);
-            const base  = Math.max(9, Math.min(14, (node.r||14)/3 + 7));
-            return Math.min(base, maxFs);
-          });
-
-        const tip = getTip();
-        g.on('mouseenter', (ev,node)=>{
-          if (node.proxyId){
-            nodeSel.selectAll('circle')
-              .attr('opacity', other => (other.proxyId && other.proxyId === node.proxyId) ? 1 : 0.35)
-              .attr('stroke-width', other => (other.proxyId && other.proxyId === node.proxyId) ? 3.5 : ( (other.tags||[]).includes('lp') ? 2.5 : 1.2 ));
-          } else if (node.connectId){
-            nodeSel.selectAll('circle')
-              .attr('opacity', other => (other.connectId && other.connectId === node.connectId) ? 1 : 0.35);
-          }
-          const peak  = Number.isFinite(node.peakTokens) ? node.peakTokens : null;
-          const left  = Number.isFinite(node.leftTokens) ? node.leftTokens : null;
-          const leftP = Number.isFinite(node.leftPct)    ? node.leftPct    : null;
-          tip.html([
-            `<div style="font-weight:700;margin-bottom:4px">${isLP(node) ? 'LP' : ((+node.pct||0).toFixed(2)+'% of supply')}</div>`,
-            `<div><b>Address:</b> ${node.address}</div>`,
-            `<div><b>Peak held:</b> ${peak!=null ? fmtNum(peak,6) : '—'} tokens</div>`,
-            `<div><b>Left:</b> ${left!=null ? fmtNum(left,6) : '—'} tokens${leftP!=null ? ` (${leftP.toFixed(1)}%)` : ''}</div>`,
-            isCreator(node) ? `<div class="mono" style="opacity:.85">Creator</div>` : '',
-            node.proxyId ? `<div class="mono" style="opacity:.85">Proxy group</div>` : '',
-            node.connectId ? `<div class="mono" style="opacity:.85">Shared funder</div>` : '',
-            `<div style="opacity:.85;margin-top:6px">Click to open in ABScan ↗</div>`
-          ].join('')).style('opacity',1);
-        }).on('mousemove', (ev)=>{
-          getTip().style('left',(ev.clientX+12)+'px').style('top',(ev.clientY+12)+'px');
-        }).on('mouseleave', ()=>{
-          nodeSel.selectAll('circle').attr('opacity', 1)
-            .attr('stroke-width', other => ( (other.tags||[]).includes('lp') ? 2.5 : (other.proxyId ? 3 : 1.2) ));
-          getTip().style('opacity',0);
-        });
-
-        g.on('click', (ev,node)=> window.open(`${EX}/address/${node.address}`, '_blank'));
-        return g;
-      });
-
-      // fit view
-      fitToView();
-      function fitToView(){
-        const bbox = rootG.node().getBBox();
-        const pad = 24;
-        const k = Math.min((width-pad*2)/Math.max(1,bbox.width),(height-pad*2)/Math.max(1,bbox.height));
-        const scale = Math.max(0.7, Math.min(3, k));
-        const tx = (width  - scale*(bbox.x + bbox.width/2));
-        const ty = (height - scale*(bbox.y + bbox.height/2));
-        const z = d3.zoom().scaleExtent([0.6,7]).on('zoom', (ev)=> rootG.attr('transform', ev.transform));
-        svg.call(z).transition().duration(450).call(z.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
-      }
-
-      // tiny legend
-      const legend = svg.append('g').attr('transform', `translate(${width-172},${14})`);
-      legend.append('rect').attr('width',160).attr('height', 58).attr('fill','rgba(0,0,0,.35)').attr('rx',8);
-      legend.append('text').attr('x',10).attr('y',18).attr('fill','#fff').attr('font-size',11).text('Group strokes:');
-      legend.append('line').attr('x1',12).attr('y1',30).attr('x2',44).attr('y2',30).attr('stroke', proxyIds.length ? proxyColor(proxyIds[0]) : '#f59e0b').attr('stroke-width',3.5);
-      legend.append('text').attr('x',50).attr('y',33).attr('fill','#fff').attr('font-size',11).text('Proxy group');
-      legend.append('rect').attr('x',12).attr('y',38).attr('width',24).attr('height',10).attr('fill', FILL_CONN);
-      legend.append('text').attr('x',50).attr('y',47).attr('fill','#fff').attr('font-size',11).text('Shared funder');
-
-      function getTip(){
-        let tip = d3.select('#bubble-tip');
-        if (tip.empty()){
-          tip = d3.select('body').append('div').attr('id','bubble-tip')
-            .style('position','fixed').style('background','#111').style('color','#fff')
-            .style('padding','8px 10px').style('border','1px solid #333').style('border-radius','8px')
-            .style('pointer-events','none').style('opacity',0).style('z-index',9999)
-            .style('font-family','ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial');
-        }
-        return tip;
-      }
-      function fmtNum(n, prec=4){
-        if (!Number.isFinite(n)) return '0';
-        const a = Math.abs(n);
-        if (a >= 1e9) return (n/1e9).toFixed(2)+'B';
-        if (a >= 1e6) return (n/1e6).toFixed(2)+'M';
-        if (a >= 1e3) return (n/1e3).toFixed(2)+'k';
-        return Number(n).toLocaleString(undefined,{ maximumFractionDigits:prec });
-      }
-    } catch (err) {
-      console.error(err);
-      rootEl.innerHTML = `<div class="banner mono">Error: ${err?.message || err}</div>`;
-    }
-  }
-
-  // ======== Container B ========
   function renderStatusGrid(list25){
     const grid=bStatusGrid(); grid.innerHTML='';
     list25.slice(0,25).forEach(r=>{
@@ -801,7 +311,9 @@
       <td class="mono">${(r.pct||0).toFixed(4)}%</td>
     </tr>`;
   }
+
   function wireBuyerRowClicks(){
+    // Click a row → open funders overlay and start scan.
     const wire = (tbody) => {
       if (!tbody) return;
       tbody.querySelectorAll('tr').forEach(tr=>{
@@ -813,82 +325,56 @@
   }
 
   async function openFundersForRow(tr){
-    const addr = tr.getAttribute('data-addr'); 
-    const ts = Number(tr.getAttribute('data-ts')||0);
+    const addr = tr.getAttribute('data-addr'); const ts = Number(tr.getAttribute('data-ts')||0);
     if (!addr) return;
-
     showOverlay(fundersOverlay());
     fundersInner().innerHTML = `<div class="banner mono"><span class="spinner"></span> Finding funding wallets (ETH + WETH)…</div>`;
     setScanStatus('Finding funding wallets (ETH + WETH)…');
-
     try{
       const { addrs, info } = await getFundingWallets(addr, ts);
-      if (!addrs.length){
-        fundersInner().innerHTML = `<div class="banner mono">No inbound ETH/WETH before first token receipt.</div>`;
-        return;
-      }
-
+      if (!addrs.length){ fundersInner().innerHTML = `<div class="banner mono">No inbound ETH/WETH before first token receipt.</div>`; return; }
       const uniq = Array.from(new Set(addrs));
       const scored=[];
       for (const a of uniq){
-        const [ethBal, port] = await Promise.all([
-          apiBalance(a).catch(()=>0),
-          tokenPortfolioUsd(a).catch(()=>({ totalUsd:0 }))
-        ]);
+        const [ethBal, port] = await Promise.all([ apiBalance(a).catch(()=>0), tokenPortfolioUsd(a).catch(()=>({ totalUsd:0 })) ]);
         if ((port.totalUsd||0) > IGNORE_FUNDER_OVER_USD) continue;
-        scored.push({
-          address:a,
-          eth:ethBal,
-          tokenUsd:port.totalUsd||0,
-          meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0}
-        });
+        scored.push({ address:a, eth:ethBal, tokenUsd:port.totalUsd||0, meta: info.get(a)||{ethCount:0,ethAmount:0,wethCount:0,wethAmount:0} });
         await sleep(60);
       }
-
       scored.sort((A,B)=> (B.tokenUsd-A.tokenUsd) || (B.eth-A.eth));
       const top = scored.slice(0, TOP_FUNDER_LIMIT);
-
-      const cardsHtml = top.map((r) => {
-        const portal = `https://portal.abs.xyz/profile/${r.address}`;
-        const abscan = `${EXPLORER}/address/${r.address}`;
-        return [
-          '<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">',
-          '  <div>',
-          `    <div class="addr mono" style="font-weight:700">${r.address}</div>`,
-          '    <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">',
-          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>`,
-          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>`,
-          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>`,
-          `      <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>`,
-          '    </div>',
-          '  </div>',
-          '  <div class="links" style="display:flex;gap:8px;flex-shrink:0">',
-          `    <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>`,
-          `    <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>`,
-          '  </div>',
-          '</div>'
-        ].join('');
-      }).join('');
-
       fundersInner().innerHTML = `
         <div class="mono" style="margin-bottom:8px">
           <b>DISCLAIMER:</b> always check the chain yourself to be 100% sure results are right.
           Top ${TOP_FUNDER_LIMIT} funders by balance. Ignored funders with &gt; $1.000.000 portfolios.
         </div>
-        ${cardsHtml}
+        ${top.map(r=>{
+          const portal=`https://portal.abs.xyz/profile/${r.address}`; const abscan=`${EXPLORER}/address/${r.address}`;
+          return `<div class="f-card" style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;margin:8px 0;background:rgba(255,255,255,.03)">
+            <div>
+              <div class="addr mono" style="font-weight:700">${r.address}</div>
+              <div class="chips" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH in: <span class="mono">${fmtNum(r.meta.ethAmount,6)} (${r.meta.ethCount})</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">WETH in: <span class="mono">${fmtNum(r.meta.wethAmount,6)} (${r.meta.wethCount})</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">Tokens $: <span class="mono">${fmtNum(r.tokenUsd,2)}</span></span>
+                <span class="chip" style="border:1px solid rgba(255,255,255,.12);border-radius:999px;padding:4px 8px">ETH bal: <span class="mono">${fmtNum(r.eth,6)}</span></span>
+              </div>
+            </div>
+            <div class="links" style="display:flex;gap:8px;flex-shrink:0">
+              <button class="btn mono" onclick="window.open('${portal}','_blank')">Portal</button>
+              <a class="btn mono" href="${abscan}" target="_blank" rel="noopener">Explorer</a>
+            </div>
+          </div>`;
+        }).join('')}
         <div style="margin-top:10px; display:none">
           <button id="findCommonBtn" class="btn mono">Find common funders among these</button>
         </div>
       `;
-
       const btn = document.getElementById('findCommonBtn');
       if (btn) btn.onclick = () => findCommonFunders(top.map(x=>x.address));
-
-    } catch(e){
+    }catch(e){
       fundersInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`;
-    } finally {
-      setScanStatus('Done. Click a wallet row to view funders.');
-    }
+    }finally{ setScanStatus('Done. Click a wallet row to view funders.'); }
   }
 
   async function findCommonFunders(addrs){
@@ -924,23 +410,146 @@
     }catch(e){ commonInner().innerHTML = `<div class="banner mono">Error: ${e.message||e}</div>`; }
   }
 
-  // ======== Render snapshot to UI ========
+  // ======== Full token overview (scan) + save ========
+  async function doFreshScan(contract){
+    const result = { meta:{ contract }, a:{}, b:{} };
+
+    setScanStatus('Downloading token transfer history…');
+    const txs = await fetchAllTokenTx(contract);
+    if (!txs.length) throw new Error('No transactions found for this token.');
+    const tokenDecimals = chooseDecimals(txs);
+
+    setScanStatus('Resolving creator & supply metrics…');
+    let creatorAddress = '';
+    try{
+      const cRes = await fetch(`${BASE_URL}?chainid=${CHAIN_ID}&module=contract&action=getcontractcreation&contractaddresses=${contract}&apikey=${ETHERSCAN_API}`);
+      const cData = await cRes.json();
+      creatorAddress = (Array.isArray(cData?.result) && cData.result[0]?.contractCreator) ? cData.result[0].contractCreator.toLowerCase() : '';
+    }catch{}
+
+    // LP pair addresses (for LP bubbles)
+    let pairAddresses = [];
+    try{
+      const pr = await fetch(`https://api.dexscreener.com/token-pairs/v1/abstract/${contract}`);
+      const pd = await pr.json();
+      if (Array.isArray(pd)){
+        for (const p of pd){
+          let pa = String(p?.pairAddress||'').toLowerCase(); if (!pa) continue;
+          if (pa.includes(':')) pa = pa.split(':')[0];
+          if (/^0x[a-f0-9]{40}$/.test(pa)) pairAddresses.push(pa);
+        }
+      }
+    }catch{}
+    pairAddresses = Array.from(new Set(pairAddresses));
+    const pairSet = new Set(pairAddresses);
+
+    const ZERO = '0x0000000000000000000000000000000000000000';
+    const DEAD = '0x000000000000000000000000000000000000dead';
+    const burnSet = new Set([ZERO, DEAD]);
+
+    const balances = {};
+    let mintedUnits=0n, burnedUnits=0n;
+    const firstInMap = new Map();
+
+    for (const t of txs){
+      const from=(t.from||t.fromAddress||'').toLowerCase(); const to=(t.to||t.toAddress||'').toLowerCase();
+      const v=toBI(t.value||'0'); const ts=Number(t.timeStamp)||0;
+      if (from===ZERO) mintedUnits+=v;
+      if (burnSet.has(to)) burnedUnits+=v;
+      // ignore contract self-moves
+      if (from===contract || to===contract) continue;
+      if (!burnSet.has(from)) balances[from]=(balances[from]||0n)-v;
+      if (!burnSet.has(to))   balances[to]=(balances[to]||0n)+v;
+      if (!firstInMap.has(to) && !burnSet.has(to)) firstInMap.set(to, { ts, v });
+    }
+    const currentSupply = mintedUnits>=burnedUnits ? (mintedUnits-burnedUnits) : 0n;
+
+    setScanStatus('Building holders set…');
+    let holdersAll = Object.entries(balances)
+      .filter(([addr,bal])=> bal>0n && !burnSet.has(addr) && !pairSet.has(addr))
+      .map(([address,units])=>({ address, units }));
+    holdersAll.sort((a,b)=> (b.units>a.units) ? 1 : (b.units<a.units) ? -1 : 0);
+
+    // verify top balances against chain at head (top 150)
+    setScanStatus('Verifying top balances…');
+    const toVerify = holdersAll.slice(0,150).map(h=>h.address); const verified={};
+    for (let i=0;i<toVerify.length;i++){ const a=toVerify[i]; verified[a]=await tokenBalanceOf(contract,a).catch(()=>null); await sleep(100); }
+    const vset=new Set(toVerify); const corrected=[];
+    for (const h of holdersAll){
+      if (vset.has(h.address)){
+        const v=verified[h.address];
+        if (v===null) corrected.push(h); else if (v===0n) continue; else corrected.push({ address:h.address, units:v });
+      } else corrected.push(h);
+    }
+    holdersAll = corrected; holdersAll.sort((a,b)=> (b.units>a.units)?1:(b.units<a.units)?-1:0);
+
+    const holdersForBubbles = holdersAll.slice(0,500).map(h=>({ address:h.address, balance:Number(h.units)/(10**tokenDecimals), pct: currentSupply>0n ? pctUnits(h.units,currentSupply):0 }));
+    const lpNodes=[];
+    for (const pa of pairAddresses){
+      const units = await tokenBalanceOf(contract, pa).catch(()=>0n);
+      lpNodes.push({ address:pa, balance:Number(units)/(10**tokenDecimals), pct: currentSupply>0n? pctUnits(units,currentSupply):0, __type:'lp' });
+      await sleep(50);
+    }
+    const top10Pct = holdersForBubbles.slice(0,10).reduce((s,h)=> s+(h.pct||0),0);
+    const creatorPct = creatorAddress ? (holdersForBubbles.find(h=>h.address.toLowerCase()===creatorAddress)?.pct || 0) : 0;
+
+    // A (stats)
+    result.a = {
+      tokenDecimals,
+      minted: Number(mintedUnits)/(10**tokenDecimals),
+      burned: Number(burnedUnits)/(10**tokenDecimals),
+      currentSupply: Number(currentSupply)/(10**tokenDecimals),
+      totalHolders: holdersAll.length,
+      top10Pct,
+      creatorAddress,
+      creatorPct,
+      holdersForBubbles,
+      lpNodes
+    };
+
+    // B (holders + receivers)
+    const top25 = holdersAll.slice(0,25).map((h,i)=>{
+      const first = firstInMap.get(h.address) || { ts:0, v:0n };
+      return {
+        rank: i+1,
+        address: h.address,
+        firstIn: Number(first.v)/(10**tokenDecimals),
+        holdings: Number(h.units)/(10**tokenDecimals),
+        pct: currentSupply>0n ? pctUnits(h.units, currentSupply) : 0
+      };
+    });
+
+    setScanStatus('Fetching Transfer logs…');
+    const receivers = await getFirst27Receivers(contract);
+    const enriched=[];
+    setScanStatus('Computing totals & statuses per wallet…');
+    for (const r of receivers){
+      const st = await enrichReceiverStats(contract, r).catch(()=>null);
+      if (st) enriched.push(st);
+      await sleep(50);
+    }
+
+    result.b = { first25: enriched.slice(0,25), top25 };
+
+    // done
+    return result;
+  }
+
   function renderFromData(snapshot){
+    // Header note
     if (aSnap()) aSnap().textContent = snapshot.ts ? new Date(snapshot.ts).toLocaleString() : '';
 
+    // Container A
     const A = snapshot.a || {};
     aStats().innerHTML = `
       <div class="statrow mono"><b>Minted</b><span>${fmtNum(A.minted,6)}</span></div>
       <div class="statrow mono"><b>Burned</b><span>${fmtNum(A.burned,6)}</span></div>
-      <div class="statrow mono"><b>Current Supply (est)</b><span>${fmtNum(A.currentSupply,6)}</span></div>
+      <div class="statrow mono"><b>Current Supply</b><span>${fmtNum(A.currentSupply,6)}</span></div>
       <div class="statrow mono"><b>Total Holders (approx)</b><span>${fmtNum(A.totalHolders,0)}</span></div>
       <div class="statrow mono"><b>Top 10 holders</b><span>${(A.top10Pct||0).toFixed(4)}%</span></div>
       <div class="statrow mono"><b>Creator</b><span>${A.creatorAddress ? `<a href="${EXPLORER}/address/${A.creatorAddress}" target="_blank" rel="noopener">${shortAddr(A.creatorAddress)}</a> <span class="muted">(${(A.creatorPct||0).toFixed(4)}%)</span>` : 'n/a'}</span></div>
     `;
-
-    const graph = buildGraphFromScan(A, (snapshot.b || {}));
-    renderBubbleGraph(aBubble(), graph);
-
+    renderBubble({ root:aBubble(), holders:(A.holdersForBubbles||[]), extras:(A.lpNodes||[]) });
     aBubbleNote().innerHTML = A.burned>0 ? `<span class="mono">🔥 Burn — ${fmtNum(A.burned,6)} tokens</span>` : '';
 
     // Container B
@@ -972,6 +581,7 @@
       };
     }
 
+    // default view
     buyersPanel().style.display=''; holdersPanel().style.display='none';
     firstBtn().classList.add('active'); topBtn().classList.remove('active');
   }
@@ -993,7 +603,7 @@
     return { usedCache:false };
   }
 
-  // 5-min holders poll (sample token)
+  // 5-min holders poll (special token)
   async function computeApproxHolders(contract){
     try{
       const txs = await fetchAllTokenTx(contract);
@@ -1015,29 +625,10 @@
     setInterval(()=>computeApproxHolders(SPECIAL_HOLDERS_CA), 5*60*1000);
   }
 
-  // ======== Internals ========
-  async function fetchAllTokenTx(contract){
-    const all=[]; const offset=10000; let page=1;
-    while(true){
-      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&page=${page}&offset=${offset}&sort=asc&apikey=${ETHERSCAN_API}`;
-      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: [];
-      if (!arr.length) break; all.push(...arr); if (arr.length<offset) break; page++; if (page>200) break; await sleep(MIN_INTERVAL_MS);
-    }
-    if (!all.length){
-      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${ETHERSCAN_API}`;
-      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: []; all.push(...arr);
-    }
-    return all;
-  }
-  function chooseDecimals(txs){
-    const freq=new Map(); for (const t of txs){ const d=parseInt(String(t.tokenDecimal||''),10); if (Number.isFinite(d)&&d>=0&&d<=18) freq.set(d,(freq.get(d)||0)+1); }
-    if (!freq.size) return 18;
-    let best=18, cnt=-1; for (const [d,c] of freq.entries()){ if (c>cnt || (c===cnt && d>best)){ best=d; cnt=c; } } return best;
-  }
-
   // ======== Public API ========
   TABS.startScan = async function(ca, { force=false } = {}){
     if (!isCA(ca)){ setScanStatus('Enter a valid token contract.'); return; }
+    // wipe UI
     aSnap().textContent=''; aStats().innerHTML=''; aBubble().innerHTML=''; aBubbleNote().textContent='';
     buyersTop5().innerHTML=''; buyersRest().innerHTML=''; holdersTop5().innerHTML=''; holdersRest().innerHTML='';
     bStatusGrid().innerHTML='';
@@ -1061,6 +652,7 @@
     bStatusGrid().innerHTML='';
   };
 
+  // Buttons & overlays
   function wireTabButtons(){
     if (!firstBtn() || !topBtn()) return;
     firstBtn().onclick = ()=>{ firstBtn().classList.add('active'); topBtn().classList.remove('active'); buyersPanel().style.display=''; holdersPanel().style.display='none'; };
@@ -1081,6 +673,187 @@
     startHoldersPoll();
   };
 
+  // ======== Internals ========
+  async function fetchAllTokenTx(contract){
+    const all=[]; const offset=10000; let page=1;
+    while(true){
+      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&page=${page}&offset=${offset}&sort=asc&apikey=${ETHERSCAN_API}`;
+      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: [];
+      if (!arr.length) break; all.push(...arr); if (arr.length<offset) break; page++; if (page>200) break; await sleep(MIN_INTERVAL_MS);
+    }
+    if (!all.length){
+      const url = `${BASE_URL}?chainid=${CHAIN_ID}&module=account&action=tokentx&contractaddress=${contract}&startblock=0&endblock=99999999&sort=asc&apikey=${ETHERSCAN_API}`;
+      const r = await fetch(url); const j = await r.json(); const arr = Array.isArray(j?.result)? j.result: []; all.push(...arr);
+    }
+    return all;
+  }
+  function chooseDecimals(txs){
+    const freq=new Map(); for (const t of txs){ const d=parseInt(String(t.tokenDecimal||''),10); if (Number.isFinite(d)&&d>=0&&d<=18) freq.set(d,(freq.get(d)||0)+1); }
+    if (!freq.size) return 18;
+    let best=18, cnt=-1; for (const [d,c] of freq.entries()){ if (c>cnt || (c===cnt && d>best)){ best=d; cnt=c; } } return best;
+  }
+
   // Expose
   global.TABS_EXT = TABS;
+})(window);
+
+
+
+/* === Bubble bundles/cluster extension (non-invasive) ===
+   - Detects "bundles" of wallets funded by the same source within a 48h window.
+   - Colors bubbles by bundle; hover highlights all bubbles in the same bundle.
+   - Shows per-wallet progress bar (bought vs still held) in tooltip.
+   - Implementation is defensive and uses MutationObserver on #bubble-canvas.
+*/
+(function(global){
+  const $ = (s) => document.querySelector(s);
+  const FUNDING_WINDOW_MS = 48 * 60 * 60 * 1000; // 2 days
+  const COLORS = ['#7bd389','#59a5d8','#f7a072','#f28482','#c4a7e7','#8bd3dd','#ffd166','#06d6a0','#a0c4ff','#ffadad'];
+
+  function hashAddr(a){ try{ return (a||'').toLowerCase(); }catch{ return a; } }
+  function pickColor(i){ return COLORS[i % COLORS.length]; }
+
+  // We expect abs-tabs-integration to dispatch this once data is ready.
+  window.addEventListener('tabs:singleTokenLoaded', (ev) => {
+    const detail = ev.detail || {};
+    const holders = detail.holders || [];
+    const txs = detail.txs || []; // must include funding info if available
+    const firstInByAddr = new Map(); // address -> first inbound (timestamp) + funder
+    for (const t of txs){
+      if (!t || t.direction!=='in') continue;
+      const to = hashAddr(t.to);
+      const from = hashAddr(t.from);
+      const ts = Number(t.timestamp||t.time||t.ts)||0;
+      if (!firstInByAddr.has(to) || ts < firstInByAddr.get(to).ts){
+        firstInByAddr.set(to, { ts, from });
+      }
+    }
+    // Bundle grouping: same funder & within 48h window of each other (simple heuristic)
+    const groups = new Map(); // bundleKey -> {color, members:Set(addr)}
+    let colorIdx = 0;
+    const entries = Array.from(firstInByAddr.entries()).sort((a,b)=>a[1].ts-b[1].ts);
+    for (let i=0;i<entries.length;i++){
+      const [addrA, metaA] = entries[i];
+      const key = metaA.from;
+      if (!key) continue;
+      let g = groups.get(key);
+      if (!g){ g = { color: pickColor(colorIdx++), members: new Set(), firstTs: metaA.ts }; groups.set(key,g); }
+      // window check vs group start
+      if (metaA.ts - g.firstTs <= FUNDING_WINDOW_MS){
+        g.members.add(addrA);
+      }
+    }
+
+    // Paint bubbles by bundle using data-address attribute
+    // We assume bubbles rendered as elements within #bubble-canvas with [data-address]
+    const root = $('#bubble-canvas');
+    if (!root) return;
+
+    // Attach a legend
+    attachLegend(root, groups);
+
+    // Colorize & hover links
+    groups.forEach((g, bundleKey) => {
+      g.members.forEach(addr => {
+        const el = root.querySelector(`[data-address="${addr}"]`);
+        if (!el) return;
+        el.style.stroke = g.color;
+        el.style.strokeWidth = '2px';
+
+        el.addEventListener('mouseenter', ()=> highlightBundle(root, g, true));
+        el.addEventListener('mouseleave', ()=> highlightBundle(root, g, false));
+      });
+    });
+
+    // Enrich tooltips with a progress bar (bought vs held) if tooltip element exists
+    // We infer buy and current balances from "holders" list (has totalIn, totalOut, balance, balancePct fields in existing script).
+    const tooltip = document.getElementById('bubbleTooltip');
+    if (tooltip){
+      root.addEventListener('mouseover', (e)=>{
+        const node = e.target?.closest('[data-address]');
+        if (!node) return;
+        const addr = node.getAttribute('data-address');
+        const h = holders.find(x => hashAddr(x.address)===hashAddr(addr));
+        if (!h) return;
+        const bought = Number(h.totalInTokens||h.totalIn||0);
+        const held = Number(h.balanceTokens||h.balance||0);
+        injectProgress(tooltip, bought, held);
+      });
+    }
+  });
+
+  function highlightBundle(root, group, on){
+    group.members.forEach(addr => {
+      const n = root.querySelector(`[data-address="${addr}"]`);
+      if (!n) return;
+      n.style.filter = on ? 'brightness(1.5)' : '';
+      n.style.opacity = on ? '1' : '';
+    });
+    // dim others
+    const others = root.querySelectorAll('[data-address]');
+    others.forEach(el => {
+      const a = el.getAttribute('data-address');
+      if (group.members.has(a)) return;
+      el.style.opacity = on ? '0.25' : '';
+      el.style.filter = on ? 'grayscale(0.7)' : '';
+    });
+  }
+
+  function injectProgress(tooltipEl, bought, held){
+    const pct = bought>0 ? Math.max(0, Math.min(100, (held/bought)*100)) : 0;
+    let bar = tooltipEl.querySelector('.held-progress');
+    if (!bar){
+      const wrap = document.createElement('div');
+      wrap.className = 'held-progress';
+      wrap.style.marginTop = '6px';
+      wrap.innerHTML = `
+        <div style="height:6px;background:rgba(255,255,255,.12);border-radius:6px;overflow:hidden">
+          <div class="held-fill" style="height:6px;width:${pct}%;background:var(--abs-green)"></div>
+        </div>
+        <div style="font-size:12px;opacity:.8;margin-top:2px">${held.toLocaleString()} / ${bought.toLocaleString()} held</div>
+      `;
+      tooltipEl.appendChild(wrap);
+    } else {
+      const fill = bar.querySelector('.held-fill');
+      if (fill) fill.style.width = pct+'%';
+      const txt = bar.querySelector('div:last-child');
+      if (txt) txt.textContent = `${(held||0).toLocaleString()} / ${(bought||0).toLocaleString()} held`;
+    }
+  }
+
+  function attachLegend(root, groups){
+    // Remove old
+    let legend = document.getElementById('bundleLegend');
+    if (legend) legend.remove();
+    legend = document.createElement('div');
+    legend.id = 'bundleLegend';
+    legend.className = 'mono';
+    legend.style.display = 'flex';
+    legend.style.flexWrap = 'wrap';
+    legend.style.gap = '8px';
+    legend.style.margin = '8px 0';
+    legend.style.alignItems = 'center';
+    legend.innerHTML = `<small class="muted">Bundles (same funder in 48h)</small>`;
+    groups.forEach((g, key) => {
+      const item = document.createElement('div');
+      item.style.display = 'inline-flex';
+      item.style.alignItems = 'center';
+      item.style.gap = '6px';
+      item.innerHTML = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${g.color}"></span><small>${key.slice(0,6)}…${key.slice(-4)}</small>`;
+      legend.appendChild(item);
+    });
+    root.prepend(legend);
+  }
+
+})(window);
+
+/* === Dispatch helper (non-invasive, safe to call multiple times) === */
+(function(global){
+  if (!global.TABS_EXT) global.TABS_EXT = {};
+  global.TABS_EXT.dispatchSingleLoaded = function(payload){
+    try{
+      const ev = new CustomEvent('tabs:singleTokenLoaded', { detail: payload || {} });
+      window.dispatchEvent(ev);
+    }catch(e){ console.error('dispatchSingleLoaded error', e); }
+  };
 })(window);
