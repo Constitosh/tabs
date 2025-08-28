@@ -192,40 +192,37 @@
 .box.fullscreen .expand-btn { background:rgba(255,255,255,.10); }
 
 
-/* Bubble view wider in overlay (Panel A only) */
-#panelOverlay #boxLeft.fullscreen { width: 100%; }
+/* ==== Bubble view in overlay (Panel A only) ==== */
 
-#panelOverlay #boxLeft.fullscreen #bubble-canvas{
-  width: 90%;           /* <-- make the bubble area 90% of overlay */
-  margin: 0 auto;       /* <-- center it */
-  min-height: 78vh;     /* keep it tall */
+/* make overlay card big */
+#panelOverlay .overlay-card {
+  width: min(98vw, 1800px);
+  max-height: 92vh;
 }
 
-/* Optional: align the stats row width with the bubble canvas */
-#panelOverlay #boxLeft.fullscreen #aTokenStats{
+/* fullscreen panel takes full width */
+#boxLeft.fullscreen { width: 100%; }
+
+/* bubble canvas bigger (90% of overlay, centered, tall) */
+#boxLeft.fullscreen #bubble-canvas {
+  width: 90%;
+  margin: 0 auto;
+  min-height: 78vh;
+}
+
+/* align token stats with bubble */
+#boxLeft.fullscreen #aTokenStats {
   width: 90%;
   margin: 0 auto 8px;
 }
 
-  
-/* Make overlay card bigger (bubble view) */
-#panelOverlay .overlay-card { width:min(98vw, 1800px); max-height:92vh; }
-.box.fullscreen { width: 100%; }
-.box.fullscreen #bubble-canvas { min-height:78vh; }
+/* ensure bubble svg fills canvas */
+#bubble-canvas svg {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
 
-/* Ensure bubble SVG fills the area */
-#bubble-canvas svg { width:100% !important; height:100% !important; display:block; }
-
-#panelOverlay .overlay-card { width:min(98vw,1600px); max-height:92vh; }  /* bigger panel */
-.box.fullscreen #bubble-canvas { min-height:72vh; }           /* bigger bubble map area */
-
-/* Bubble view: go BIG in overlay */
-#panelOverlay .overlay-card { width: min(98vw, 1800px); max-height: 92vh; }
-.box.fullscreen { width: 100%; }
-.box.fullscreen #bubble-canvas { min-height: 78vh; }   /* taller canvas area */
-
-/* Ensure the bubble SVG fills its box */
-#bubble-canvas svg { width: 100% !important; height: 100% !important; display: block; }
 
   /* ========= BOOT OVERLAY + PROGRESS BAR ========= */
   #bootOverlay{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.6); z-index:120; }
@@ -368,8 +365,7 @@
   <!-- NEW: Panel fullscreen overlay (for A or B) -->
   <div class="overlay" id="panelOverlay">
     <div class="overlay-card">
-      <button id="closePanelOverlay" class="overlay-close">✕</button>
-      <div id="panelOverlaySlot"></div>
+    <div id="panelOverlaySlot"></div>
     </div>
   </div>
 
