@@ -172,9 +172,6 @@
   .progress > div{ height:100%; width:0%; background:linear-gradient(90deg, var(--abs-green), #32d896); transition:width .35s ease; }
   #bootRetry{ display:none; margin-top:10px; }
    
-
-  .holder-buckets .meta{ color:var(--muted); }
-  #bundleLegend small.muted{ opacity:.7 }
 </style>
 </head>
 <body>
@@ -242,7 +239,6 @@
             <h3 class="mono" id="aTitle">Token Allocation &amp; Stats <small class="muted mono" id="aSnapshot" style="font-weight:400;margin-left:6px"></small></h3>
             <div id="aTokenStats"></div>
             <div id="bubble-canvas"></div>
-<div id="bubbleTooltip" class="mono" style="position:absolute;display:none;pointer-events:none;z-index:50"></div>
             <div class="mono muted" id="a-bubble-note"><span id="bubbleStatusText"></span></div>
           </div>
 
@@ -567,7 +563,6 @@ document.addEventListener('DOMContentLoaded', () => {
   window.TABS_APP?.boot();
 });
 </script>
-
 <script src="holder-stats-panel.js"></script>
 </body>
 </html>
