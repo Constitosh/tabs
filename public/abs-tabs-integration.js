@@ -857,3 +857,79 @@
     }catch(e){ console.error('dispatchSingleLoaded error', e); }
   };
 })(window);
+
+
+/* === Auto-dispatch shim (no changes to your code needed) ===
+   This wraps common functions used in single-token mode so the 'tabs:singleTokenLoaded' event fires
+   automatically after the bubbles render. No math is touched.
+*/
+(function(global){
+  if (!global.TABS_EXT) global.TABS_EXT = {};
+  if (!global.TABS_EXT._autoShimApplied){
+    const dispatch = (payload)=>{
+      try {
+        const ev = new CustomEvent('tabs:singleTokenLoaded', { detail: payload||{} });
+        window.dispatchEvent(ev);
+      } catch(e){ console.error('auto-dispatch error', e); }
+    };
+
+    // Wrap drawBubbles(holders, ...)
+    if (typeof global.drawBubbles === 'function'){
+      const _drawBubbles = global.drawBubbles;
+      global.drawBubbles = function(holders){
+        const ret = _drawBubbles.apply(this, arguments);
+        try{
+          const token = global.__currentTokenRow || null;
+          const txs = global.__currentTxs || [];
+          dispatch({ token, holders, txs });
+        }catch(e){ /*noop*/ }
+        return ret;
+      };
+    }
+
+    // Also wrap renderSingle(ca, row?) to stash context for the dispatch
+    if (typeof global.renderSingle === 'function'){
+      const _renderSingle = global.renderSingle;
+      global.renderSingle = async function(){
+        try{
+          const ca = arguments[0];
+          const row = arguments[1];
+          if (row) global.__currentTokenRow = row;
+        }catch(e){ /*noop*/ }
+        const ret = await _renderSingle.apply(this, arguments);
+        // If drawBubbles didn't run for some reason, try a delayed best-effort dispatch
+        setTimeout(()=>{
+          try{
+            const holders = global.__lastHoldersForBubbles || null;
+            if (holders && Array.isArray(holders)){
+              dispatch({ token: global.__currentTokenRow||null, holders, txs: global.__currentTxs||[] });
+            }
+          }catch(e){}
+        }, 0);
+        return ret;
+      };
+    }
+
+    // If your code calls a builder before drawBubbles, capture the holders for fallback
+    if (!global._holdersToBubblesProxyInstalled){
+      Object.defineProperty(global, '__lastHoldersForBubbles', {
+        configurable: true, enumerable: false, writable: true, value: null
+      });
+      const saveHolders = function(h){
+        try{ if (Array.isArray(h)) global.__lastHoldersForBubbles = h; }catch(e){}
+      };
+      // Proxy a common helper if present
+      if (typeof global.buildHoldersForToken === 'function'){
+        const _build = global.buildHoldersForToken;
+        global.buildHoldersForToken = async function(){
+          const r = await _build.apply(this, arguments);
+          saveHolders(r);
+          return r;
+        };
+      }
+      global._holdersToBubblesProxyInstalled = true;
+    }
+
+    global.TABS_EXT._autoShimApplied = true;
+  }
+})(window);
