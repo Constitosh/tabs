@@ -176,6 +176,11 @@
     tbody td{padding:8px 8px}
     #bubble-canvas{min-height:150px}
   }
+  /* ==== Fullscreen tweaks for panel overlays ==== */
+.box.fullscreen .expand-btn { display:none; }                 /* hide + while in overlay */
+#panelOverlay .overlay-card { width:min(98vw,1600px); max-height:92vh; }  /* bigger panel */
+.box.fullscreen #bubble-canvas { min-height:72vh; }           /* bigger bubble map area */
+
 
   /* ========= BOOT OVERLAY + PROGRESS BAR ========= */
   #bootOverlay{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.6); z-index:120; }
@@ -495,26 +500,29 @@
     document.getElementById('scanStatus').textContent='';
   }
 
-  async function renderSingle(ca){
-    enterSingleTokenMode(); currentCA=ca.toLowerCase();
-    document.getElementById('expander').style.display='none';
-    try{
-      const j = await addToken(currentCA);
-      if(!j.ok || !j.row){
-        document.getElementById('top5').innerHTML = `<tr><td colspan="6">No data for ${currentCA}</td></tr>`;
-        document.getElementById('rest10').innerHTML = '';
-      }else{
-        setTracked(j.tokensTracked);
-        document.getElementById('top5').innerHTML = await mkRow(0,j.row);
-        document.getElementById('rest10').innerHTML = '';
-      }
-    }catch(e){
-      document.getElementById('top5').innerHTML = `<tr><td colspan="6">Fetch error for ${currentCA}</td></tr>`;
+async function renderSingle(ca){
+  enterSingleTokenMode(); currentCA=ca.toLowerCase();
+  document.getElementById('expander').style.display='none';
+  try{
+    const j = await addToken(currentCA);
+    if(!j.ok || !j.row){
+      document.getElementById('top5').innerHTML = `<tr><td colspan="6">No data for ${currentCA}</td></tr>`;
       document.getElementById('rest10').innerHTML = '';
+    }else{
+      setTracked(j.tokensTracked);
+      document.getElementById('top5').innerHTML = await mkRow(0,j.row);
+      document.getElementById('rest10').innerHTML = '';
+      /* NEW: wire chart + icon clicks for single row */
+      wireTokenIconClicks();
     }
-    // Kick off the deep scan (A+B) — cache-first
-    window.TABS_EXT && window.TABS_EXT.startScan(currentCA);
+  }catch(e){
+    document.getElementById('top5').innerHTML = `<tr><td colspan="6">Fetch error for ${currentCA}</td></tr>`;
+    document.getElementById('rest10').innerHTML = '';
   }
+  // Kick off the deep scan (A+B) — cache-first
+  window.TABS_EXT && window.TABS_EXT.startScan(currentCA);
+}
+
   async function startSingleFromIcon(ca){
     document.getElementById('search').value=ca;
     await renderSingle(ca);
@@ -553,33 +561,43 @@
     }catch(e){ console.warn('Header override failed:',e); }
   }
 
-  /* ---------- Panel fullscreen overlay logic ---------- */
-  const panelOverlay = document.getElementById('panelOverlay');
-  const panelSlot    = document.getElementById('panelOverlaySlot');
-  const closePanel   = document.getElementById('closePanelOverlay');
+/* ---------- Panel fullscreen overlay logic ---------- */
+const panelOverlay = document.getElementById('panelOverlay');
+const panelSlot    = document.getElementById('panelOverlaySlot');
+const closePanel   = document.getElementById('closePanelOverlay');
 
-  let restore = null; // function to restore original position
+let restore = null; // function to restore original position
 
-  function openPanelOverlay(fromEl){
-    if (!fromEl || !panelOverlay || !panelSlot) return;
-    // Create placeholder to restore position
-    const ph = document.createElement('div');
-    ph.style.display = 'none';
-    fromEl.parentNode.insertBefore(ph, fromEl);
-    panelSlot.innerHTML = '';
-    panelSlot.appendChild(fromEl);
-    panelOverlay.style.display = 'flex';
-    restore = ()=>{
-      if (ph.parentNode){ ph.parentNode.insertBefore(fromEl, ph); ph.remove(); }
-      panelOverlay.style.display='none';
-      restore=null;
-    };
-  }
-  closePanel?.addEventListener('click', ()=>{ restore && restore(); });
-  panelOverlay?.addEventListener('click', (e)=>{ if(e.target===panelOverlay){ restore && restore(); } });
+function openPanelOverlay(fromEl){
+  if (!fromEl || !panelOverlay || !panelSlot) return;
+  // placeholder to restore position
+  const ph = document.createElement('div');
+  ph.style.display = 'none';
+  fromEl.parentNode.insertBefore(ph, fromEl);
 
-  document.getElementById('expandA')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxLeft')));
-  document.getElementById('expandB')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxRight')));
+  // move + enlarge
+  panelSlot.innerHTML = '';
+  panelSlot.appendChild(fromEl);
+  fromEl.classList.add('fullscreen');               // <— hide + and enlarge
+  panelOverlay.style.display = 'flex';
+
+  restore = ()=>{
+    if (ph.parentNode){
+      ph.parentNode.insertBefore(fromEl, ph);
+      ph.remove();
+    }
+    fromEl.classList.remove('fullscreen');          // <— show + again, restore size
+    panelOverlay.style.display='none';
+    restore=null;
+  };
+}
+
+closePanel?.addEventListener('click', ()=>{ restore && restore(); });
+panelOverlay?.addEventListener('click', (e)=>{ if(e.target===panelOverlay){ restore && restore(); } });
+
+document.getElementById('expandA')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxLeft')));
+document.getElementById('expandB')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxRight')));
+
 
   /* ---------- Dexscreener chart overlay ---------- */
   const dexOverlay = document.getElementById('dexOverlay');
