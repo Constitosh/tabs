@@ -12,7 +12,7 @@
 </script>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>The tABS Laporatory</title>
+<title>The tABS Laboratory</title>
 <link rel="icon" type="image/png" href="https://cdn.dexscreener.com/cms/images/4GoBllwMTEijvbAI?width=64&height=64&quality=90">
 <style>
   :root{ --abs-green:#07c160; --bg:#0b1f17; --panel:#0f2a20; --muted:#89b6a0; --text:#e8fff3; --danger:#ff6b6b; --info:#5aa7ff; }
@@ -186,7 +186,27 @@
     #bubble-canvas{min-height:150px}
   }
   /* ==== Fullscreen tweaks for panel overlays ==== */
-.box.fullscreen .expand-btn { display:none; }                 /* hide + while in overlay */
+/* Expand / Collapse button (big, easy to tap) */
+.expand-btn{
+  position:absolute; top:10px; right:10px;
+  width:42px; height:42px; border-radius:12px;
+  border:1px solid rgba(255,255,255,.18);
+  background:rgba(255,255,255,.08);
+  color:#d9ffe8; cursor:pointer; font-weight:900; font-size:22px; line-height:1;
+  display:flex; align-items:center; justify-content:center;
+}
+
+/* In fullscreen, the same button shows “−” and stays visible */
+.box.fullscreen .expand-btn { background:rgba(255,255,255,.10); }
+
+/* Make overlay card bigger (bubble view) */
+#panelOverlay .overlay-card { width:min(98vw, 1800px); max-height:92vh; }
+.box.fullscreen { width: 100%; }
+.box.fullscreen #bubble-canvas { min-height:78vh; }
+
+/* Ensure bubble SVG fills the area */
+#bubble-canvas svg { width:100% !important; height:100% !important; display:block; }
+
 #panelOverlay .overlay-card { width:min(98vw,1600px); max-height:92vh; }  /* bigger panel */
 .box.fullscreen #bubble-canvas { min-height:72vh; }           /* bigger bubble map area */
 
@@ -577,47 +597,27 @@ async function renderSingle(ca){
     }catch(e){ console.warn('Header override failed:',e); }
   }
 
-/* ---------- Panel fullscreen overlay logic ---------- */
+/* ---------- Panel fullscreen overlay logic (new) ---------- */
 const panelOverlay = document.getElementById('panelOverlay');
 const panelSlot    = document.getElementById('panelOverlaySlot');
-const closePanel   = document.getElementById('closePanelOverlay');
 
-let restore = null; // function to restore original position
+const restores = new Map(); // boxEl -> restore() fn
 
-function openPanelOverlay(fromEl){
-  if (!fromEl || !panelOverlay || !panelSlot) return;
-  // placeholder to restore position
-  const ph = document.createElement('div');
-  ph.style.display = 'none';
-  fromEl.parentNode.insertBefore(ph, fromEl);
-
-  // move + enlarge
-  panelSlot.innerHTML = '';
-  panelSlot.appendChild(fromEl);
-  fromEl.classList.add('fullscreen');               // hide + and enlarge
-  panelOverlay.style.display = 'flex';
-
-  // If this is Panel A (bubble view), trigger resize + zoom wiring
-  if (fromEl.id === 'boxLeft') {
-    // give layout a tick to compute sizes, then nudge any responsive render
-    setTimeout(()=>{
-      window.dispatchEvent(new Event('resize'));     // for responsive charts that listen to resize
-      window.TABS_EXT?.resize?.();                   // if your integration exposes a resize()
-      wireBubbleZoom();                              // add zoom/pan if not already
-    }, 0);
-  }
-
-  restore = ()=>{
-    if (ph.parentNode){
-      ph.parentNode.insertBefore(fromEl, ph);
-      ph.remove();
+function makeRestore(fromEl, placeholder){
+  return ()=>{
+    if (placeholder.parentNode){
+      placeholder.parentNode.insertBefore(fromEl, placeholder);
+      placeholder.remove();
     }
-    fromEl.classList.remove('fullscreen');          // show + again, restore size
-    panelOverlay.style.display='none';
-    restore=null;
+    fromEl.classList.remove('fullscreen');
+    // flip button back to +
+    const btn = fromEl.querySelector('.expand-btn');
+    if (btn){ btn.textContent = '+'; btn.setAttribute('aria-label','Expand'); }
+    panelOverlay.style.display = 'none';
+    restores.delete(fromEl);
 
-    if (fromEl.id === 'boxLeft') {
-      // reflow back in place (optional, harmless if no-op)
+    // reflow back in place (bubble)
+    if (fromEl.id === 'boxLeft'){
       setTimeout(()=>{
         window.dispatchEvent(new Event('resize'));
         window.TABS_EXT?.resize?.();
@@ -626,11 +626,65 @@ function openPanelOverlay(fromEl){
   };
 }
 
-closePanel?.addEventListener('click', ()=>{ restore && restore(); });
-panelOverlay?.addEventListener('click', (e)=>{ if(e.target===panelOverlay){ restore && restore(); } });
+function openPanelOverlay(fromEl){
+  if (!fromEl || restores.has(fromEl)) return;
+  // placeholder to restore layout
+  const ph = document.createElement('div');
+  ph.style.display = 'none';
+  fromEl.parentNode.insertBefore(ph, fromEl);
 
-document.getElementById('expandA')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxLeft')));
-document.getElementById('expandB')?.addEventListener('click', ()=> openPanelOverlay(document.getElementById('boxRight')));
+  // move into overlay
+  panelSlot.innerHTML = '';
+  panelSlot.appendChild(fromEl);
+  fromEl.classList.add('fullscreen');
+
+  // flip button to −
+  const btn = fromEl.querySelector('.expand-btn');
+  if (btn){ btn.textContent = '−'; btn.setAttribute('aria-label','Collapse'); }
+
+  panelOverlay.style.display = 'flex';
+  restores.set(fromEl, makeRestore(fromEl, ph));
+
+  // bubble: nudge resize + add zoom/pan once
+  if (fromEl.id === 'boxLeft'){
+    setTimeout(()=>{
+      window.dispatchEvent(new Event('resize'));
+      window.TABS_EXT?.resize?.();
+      wireBubbleZoom();   // no-op if already wired
+    }, 0);
+  }
+}
+
+function closeCurrentOverlay(){
+  const boxInOverlay = panelSlot.firstElementChild;
+  if (boxInOverlay && restores.has(boxInOverlay)){
+    restores.get(boxInOverlay)();
+  } else {
+    panelOverlay.style.display = 'none';
+  }
+}
+
+// Clicking the overlay backdrop closes it
+panelOverlay?.addEventListener('click', (e)=>{
+  if (e.target === panelOverlay) closeCurrentOverlay();
+});
+
+// One handler for both A and B (+ / − toggle)
+document.querySelectorAll('.expand-btn').forEach(btn=>{
+  btn.addEventListener('click', (e)=>{
+    e.preventDefault(); e.stopPropagation();
+    const box = btn.closest('.box');
+    if (!box) return;
+    if (box.classList.contains('fullscreen')){
+      // currently expanded → collapse
+      closeCurrentOverlay();
+    } else {
+      // collapsed → expand
+      openPanelOverlay(box);
+    }
+  });
+});
+
 
 /* ---------- Bubble zoom/pan (D3) ---------- */
 let bubbleZoomWired = false;
